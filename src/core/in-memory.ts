@@ -75,7 +75,7 @@ export class InMemoryActionLedger implements ActionLedger {
       throw new Error(`Execution has not been started: ${receipt.identity.eventKey}`);
     }
     if (record.receipt) {
-      throw new Error(`Receipt already exists: ${receipt.identity.eventKey}`);
+      throw new StaleWriteError(`Receipt already exists: ${receipt.identity.eventKey}`);
     }
     if (!this.matchesIdentity(record.identity, receipt.identity)) {
       throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
