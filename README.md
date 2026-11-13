@@ -77,6 +77,21 @@ npm run test:needs-forever
 
 The live path starts the real NF worker/controller/judge control process, performs one disposable file side effect, forces an observation `UNKNOWN`, recovers by DPC readback without re-execution, verifies duplicate dispatch, same-action handoff, and selection of the next action. The test does not use a simulated fixture and does not persist credentials or absolute workspace paths in receipts or handoffs.
 
+## Durable persistence
+
+The first durable persistence slice uses PostgreSQL as the single execution store. `PostgresExecutionStore` implements the durable action ledger and claim authority together so claim/fence validation, receipt append/replace, lifecycle update, outbox insertion and claim release can share one transaction. `PostgresWakeStore` and `PostgresHandoffStore` persist the existing WakeIntent and HandoffBundle seams, while `ReconciliationRunner` exposes durable reconciliation candidates without retrying an external side effect.
+
+The schema includes executions, append-only receipts, claims, transactional outbox events, wake intents, handoff bundles, inbox dedupe and migration tracking. Event idempotency is scoped by `programId + planId + eventKey`; stale fences are rejected by conditional transaction checks. PostgreSQL remains an adapter behind the Core seam; GitHub remains plan authority.
+
+The PostgreSQL integration tests are opt-in and require a disposable PostgreSQL database:
+
+```powershell
+$env:DPC_POSTGRES_URL="<local-postgres-connection-string>"
+npm run test:postgres
+```
+
+The integration suite verifies durable UNKNOWN recovery, event dedupe, append-only receipt behavior, outbox creation, wake lease/dedupe/writeback and full-identity handoff acceptance. The normal `npm test` command skips these tests unless `DPC_POSTGRES_URL` is set.
+
 ## Standard Kit and projection isolation
 
 `inspectProfileConformance` applies shared descriptor checks to every profile; profile code does not implement Core lifecycle or execution safety. `ClaimAuthority` exposes only execution-right operations. `ProjectionAdapter` can publish/read a derived view and report drift against an authoritative snapshot, but it has no plan, ledger, claim, or scheduler write operation.
@@ -99,7 +114,7 @@ An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.r
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory and real-side-effect adapters. The current local suite has 40 tests: 38 pass and the two opt-in live tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, and the real Needs Forever adapter seam. Durable persistence and crash-window reconciliation remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current local suite has 42 tests: 38 pass and four opt-in live/integration tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
 
 ## Commands
 
