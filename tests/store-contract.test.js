@@ -27,6 +27,7 @@ import pg from "pg";
 import {
   ClaimConflictError,
   DpcCore,
+  InMemoryClaimAuthority,
   InMemoryDurableStore,
   InMemoryPlanSource,
   InMemoryProfile,
@@ -438,6 +439,50 @@ function runContractSuite(label, getStore) {
     }
   });
 
+  test(`[${label}] T2: appendReceiptWithClaim rejects receipt with stale stable identity`, async () => {
+    // INV-ID-3: a NF result carrying a stale identity (wrong planRevision or runGeneration)
+    // must be rejected by appendReceiptWithClaim before any receipt is committed.
+    const { store, cleanup } = getStore("stale-identity");
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const programId = id(`contract-prog-si-${ts}-${label}`);
+      const planId = id("contract-plan-si");
+      const actionId = id("action-si");
+      const eventKey = id("si-event");
+      const planRevision = id("r1");
+      const nfTaskId = id(`nf-si-${ts}`);
+      const identity = { programId, planId, planRevision, actionId, eventKey, nfTaskId, runGeneration: 1, claimFence: 0 };
+      const descriptor = makeDescriptor(actionId);
+
+      await store.beginExecution(identity, descriptor);
+      const claimed = await store.claim(identity, "owner-si", Date.now());
+
+      // Receipt that claims a different planRevision than the stored row
+      const staleReceipt = {
+        identity: { ...claimed, planRevision: id("stale-rev") },
+        actionType: `contract.${actionId}`,
+        nfStatus: "DONE",
+        businessStatus: "COMPLETED",
+        evidence: [],
+        recordedAt: Date.now(),
+      };
+
+      await assert.rejects(
+        () => store.appendReceiptWithClaim(staleReceipt, store, Date.now()),
+        StaleWriteError,
+        "receipt with stale planRevision must throw StaleWriteError",
+      );
+
+      // No partial write: record must still have no receipt
+      const after = await store.findByEventKey(programId, planId, eventKey);
+      assert.ok(after, "record must still exist");
+      assert.equal(after.receipt, undefined, "no partial receipt must have been committed");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test(`[${label}] T2: duplicate outbox — repeated receipt write with same dedupe key is safe (idempotent)`, async () => {
     // This test verifies that a re-delivered dispatch (e.g. from an at-least-once
     // message bus) does not blow up. The store-level guard is the scoped idempotency
@@ -488,6 +533,80 @@ function runContractSuite(label, getStore) {
 // Run suite against InMemoryDurableStore
 // ---------------------------------------------------------------------------
 runContractSuite("InMemory", (_suffix) => makeStore("memory"));
+
+// ---------------------------------------------------------------------------
+// InMemoryClaimAuthority.listExpiredClaims — the public seam used by
+// InMemoryDurableStore.listReconciliationCandidates (Finding 1).
+// Previously the durable store reached into the private claims map via
+// this.claims["claims"]; this test pins the new public method directly.
+// ---------------------------------------------------------------------------
+test("[InMemory] listExpiredClaims returns only expired entries, not active ones", async () => {
+  const fixedClock = () => 1000;
+  const authority = new InMemoryClaimAuthority(5_000, fixedClock); // 5s lease
+  const now = fixedClock();
+
+  const identity = {
+    programId: id("program-exp"),
+    planId: id("plan-exp"),
+    planRevision: id("r1"),
+    actionId: id("action-exp"),
+    eventKey: id("event-exp"),
+    nfTaskId: id("nf-exp"),
+    runGeneration: 1,
+    claimFence: 0,
+  };
+
+  // Claim at t=1000; lease expires at t=6000
+  await authority.claim(identity, "owner-a", now);
+
+  // At t=5000 the lease is still active — no expired claims
+  const beforeExpiry = authority.listExpiredClaims(5000);
+  assert.equal(beforeExpiry.length, 0, "must return no expired claims while lease is active");
+
+  // At t=6000 the lease has expired (<= comparison) — the claim appears
+  const atExpiry = authority.listExpiredClaims(6000);
+  assert.equal(atExpiry.length, 1, "must return the expired claim at exactly the expiry time");
+  assert.equal(atExpiry[0].identity.eventKey, "event-exp");
+
+  // Well past expiry
+  const afterExpiry = authority.listExpiredClaims(99_999);
+  assert.equal(afterExpiry.length, 1, "must still return the expired claim long after expiry");
+});
+
+test("[InMemory] listExpiredClaims returns empty for a store with no claims", () => {
+  const authority = new InMemoryClaimAuthority(30_000, () => Date.now());
+  assert.equal(authority.listExpiredClaims(Date.now()).length, 0);
+});
+
+test("[InMemory] listExpiredClaims returns multiple expired claims, excludes active ones", async () => {
+  const fixedClock = () => 1000;
+  const authority = new InMemoryClaimAuthority(5_000, fixedClock);
+
+  const makeIdentity = (actionId, eventKey) => ({
+    programId: id("program-multi"),
+    planId: id("plan-multi"),
+    planRevision: id("r1"),
+    actionId: id(actionId),
+    eventKey: id(eventKey),
+    nfTaskId: id(`nf-${eventKey}`),
+    runGeneration: 1,
+    claimFence: 0,
+  });
+
+  // Two claims that will both be expired at t=6000
+  await authority.claim(makeIdentity("action-a", "event-a"), "owner-a", 1000);
+  await authority.claim(makeIdentity("action-b", "event-b"), "owner-b", 1000);
+
+  // Third claim at t=6000 with 5s lease → expires at 11000, active at 6000
+  await authority.claim(makeIdentity("action-c", "event-c"), "owner-c", 6000);
+
+  const expiredAt7000 = authority.listExpiredClaims(7000);
+  assert.equal(expiredAt7000.length, 2, "must return exactly the two expired claims, not the active one");
+  const expiredKeys = new Set(expiredAt7000.map((e) => e.identity.eventKey));
+  assert.ok(expiredKeys.has("event-a"));
+  assert.ok(expiredKeys.has("event-b"));
+  assert.ok(!expiredKeys.has("event-c"), "active claim must not appear in expired set");
+});
 
 // ---------------------------------------------------------------------------
 // Run suite against PostgresExecutionStore (skipped if no connection string)
