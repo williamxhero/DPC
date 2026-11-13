@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   ActionDescriptor,
@@ -16,8 +16,13 @@ interface LocalFileTarget {
 }
 
 interface EffectMarker {
+  readonly programId: string;
+  readonly planId: string;
+  readonly planRevision: string;
+  readonly actionId: string;
   readonly nfTaskId: string;
   readonly eventKey: string;
+  readonly runGeneration: number;
   readonly relativePath: string;
   readonly content: string;
 }
@@ -41,12 +46,13 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
 
   public async execute(request: NfExecutionRequest): Promise<NfExecutionResult> {
     const target = this.targetFrom(request.action);
-    const targetPath = this.safePath(target.relativePath);
+    const targetPath = await this.safePath(target.relativePath);
+    await this.assertNoReparsePoints(this.markerDir);
     const markerPath = this.markerPath(request.identity);
     const existingMarker = await this.readMarker(markerPath);
 
     if (existingMarker) {
-      if (!this.sameMarker(existingMarker, request, target)) {
+      if (!this.sameMarker(existingMarker, request.identity, target)) {
         throw new Error(`Idempotency marker conflicts for ${request.identity.nfTaskId}`);
       }
       try {
@@ -65,6 +71,7 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     }
 
     await mkdir(path.dirname(targetPath), { recursive: true });
+    await this.assertNoReparsePoints(targetPath);
     let current: string | undefined;
     try {
       current = await readFile(targetPath, "utf8");
@@ -79,9 +86,15 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     }
 
     await mkdir(this.markerDir, { recursive: true });
+    await this.assertNoReparsePoints(this.markerDir);
     const marker: EffectMarker = {
+      programId: request.identity.programId,
+      planId: request.identity.planId,
+      planRevision: request.identity.planRevision,
+      actionId: request.identity.actionId,
       nfTaskId: request.identity.nfTaskId,
       eventKey: request.identity.eventKey,
+      runGeneration: request.identity.runGeneration,
       relativePath: target.relativePath,
       content: target.content,
     };
@@ -90,7 +103,7 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     } catch (error) {
       if (!this.isAlreadyExists(error)) throw error;
       const racedMarker = await this.readMarker(markerPath);
-      if (!racedMarker || !this.sameMarker(racedMarker, request, target)) {
+      if (!racedMarker || !this.sameMarker(racedMarker, request.identity, target)) {
         throw new Error(`Concurrent idempotency marker conflict for ${request.identity.nfTaskId}`);
       }
     }
@@ -100,9 +113,10 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
 
   public async readback(request: NfExecutionRequest): Promise<NfExecutionResult | undefined> {
     const target = this.targetFrom(request.action);
-    const targetPath = this.safePath(target.relativePath);
+    const targetPath = await this.safePath(target.relativePath);
+    await this.assertNoReparsePoints(this.markerDir);
     const marker = await this.readMarker(this.markerPath(request.identity));
-    if (!marker || !this.sameMarker(marker, request, target)) {
+    if (!marker || !this.sameMarker(marker, request.identity, target)) {
       return undefined;
     }
     try {
@@ -115,12 +129,18 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     return this.done(request.identity, target, "readback");
   }
 
-  public async cleanup(action: ActionDescriptor, identity?: ExecutionIdentity): Promise<void> {
+  public async cleanup(action: ActionDescriptor, identity: ExecutionIdentity): Promise<void> {
     const target = this.targetFrom(action);
-    await rm(this.safePath(target.relativePath), { force: true });
-    if (identity) {
-      await rm(this.markerPath(identity), { force: true });
+    const targetPath = await this.safePath(target.relativePath);
+    await this.assertNoReparsePoints(this.markerDir);
+    const markerPath = this.markerPath(identity);
+    const marker = await this.readMarker(markerPath);
+    if (!marker) return;
+    if (!this.sameMarker(marker, identity, target)) {
+      throw new Error(`Local file cleanup refused an unowned effect: ${target.relativePath}`);
     }
+    await rm(targetPath, { force: true });
+    await rm(markerPath, { force: true });
   }
 
   private done(identity: ExecutionIdentity, target: LocalFileTarget, operation: string): NfExecutionResult {
@@ -155,7 +175,7 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     return { relativePath: candidate.relativePath, content: candidate.content };
   }
 
-  private safePath(relativePath: string): string {
+  private async safePath(relativePath: string): Promise<string> {
     if (!relativePath || path.isAbsolute(relativePath)) {
       throw new Error("Local file path must be a non-empty relative path");
     }
@@ -165,7 +185,34 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative) || normalized === ".dpc-effects" || normalized.startsWith(".dpc-effects/")) {
       throw new Error("Local file path escapes the configured root");
     }
+    await this.assertNoReparsePoints(target);
     return target;
+  }
+
+  private async assertNoReparsePoints(target: string): Promise<void> {
+    const relative = path.relative(this.rootDir, target);
+    let current = this.rootDir;
+    const rootStat = await this.lstatIfPresent(current);
+    if (rootStat?.isSymbolicLink()) {
+      throw new Error("Local file root cannot be a symbolic link or junction");
+    }
+    for (const segment of relative.split(path.sep).filter(Boolean)) {
+      current = path.join(current, segment);
+      const stat = await this.lstatIfPresent(current);
+      if (!stat) break;
+      if (stat.isSymbolicLink()) {
+        throw new Error("Local file path cannot traverse a symbolic link or junction");
+      }
+    }
+  }
+
+  private async lstatIfPresent(target: string): Promise<import("node:fs").Stats | undefined> {
+    try {
+      return await lstat(target);
+    } catch (error) {
+      if (this.isMissing(error)) return undefined;
+      throw error;
+    }
   }
 
   private markerPath(identity: ExecutionIdentity): string {
@@ -177,7 +224,16 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
       const parsed: unknown = JSON.parse(await readFile(markerPath, "utf8"));
       if (!parsed || typeof parsed !== "object") return undefined;
       const marker = parsed as Record<string, unknown>;
-      if (typeof marker.nfTaskId !== "string" || typeof marker.eventKey !== "string" || typeof marker.relativePath !== "string" || typeof marker.content !== "string") {
+      if (typeof marker.programId !== "string"
+        || typeof marker.planId !== "string"
+        || typeof marker.planRevision !== "string"
+        || typeof marker.actionId !== "string"
+        || typeof marker.nfTaskId !== "string"
+        || typeof marker.eventKey !== "string"
+        || typeof marker.runGeneration !== "number"
+        || !Number.isInteger(marker.runGeneration)
+        || typeof marker.relativePath !== "string"
+        || typeof marker.content !== "string") {
         return undefined;
       }
       return marker as unknown as EffectMarker;
@@ -187,9 +243,14 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     }
   }
 
-  private sameMarker(marker: EffectMarker, request: NfExecutionRequest, target: LocalFileTarget): boolean {
-    return marker.nfTaskId === request.identity.nfTaskId
-      && marker.eventKey === request.identity.eventKey
+  private sameMarker(marker: EffectMarker, identity: ExecutionIdentity, target: LocalFileTarget): boolean {
+    return marker.programId === identity.programId
+      && marker.planId === identity.planId
+      && marker.planRevision === identity.planRevision
+      && marker.actionId === identity.actionId
+      && marker.nfTaskId === identity.nfTaskId
+      && marker.eventKey === identity.eventKey
+      && marker.runGeneration === identity.runGeneration
       && marker.relativePath === target.relativePath
       && marker.content === target.content;
   }

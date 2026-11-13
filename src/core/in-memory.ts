@@ -41,14 +41,15 @@ export class InMemoryPlanSource implements PlanSource {
 }
 
 export class InMemoryActionLedger implements ActionLedger {
-  private readonly recordsByEvent = new Map<EventKey, ExecutionRecord>();
+  private readonly recordsByEvent = new Map<string, ExecutionRecord>();
   private readonly recordsByAction = new Map<string, ExecutionRecord[]>();
 
   public async beginExecution(
     identity: ExecutionIdentity,
     action: ActionDescriptor,
   ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
-    const existing = this.recordsByEvent.get(identity.eventKey);
+    const eventKey = this.eventKey(identity);
+    const existing = this.recordsByEvent.get(eventKey);
     if (existing) {
       return { created: false, record: existing };
     }
@@ -58,15 +59,17 @@ export class InMemoryActionLedger implements ActionLedger {
       action,
       lifecycle: "STARTED",
     };
-    this.recordsByEvent.set(identity.eventKey, record);
+    this.recordsByEvent.set(eventKey, record);
     const records = this.recordsByAction.get(this.actionKey(identity)) ?? [];
     records.push(record);
     this.recordsByAction.set(this.actionKey(identity), records);
     return { created: true, record };
   }
 
-  public async appendReceipt(receipt: Receipt): Promise<void> {
-    const record = this.recordsByEvent.get(receipt.identity.eventKey);
+  public async appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void> {
+    await claims.assertValid(receipt.identity, now);
+    const eventKey = this.eventKey(receipt.identity);
+    const record = this.recordsByEvent.get(eventKey);
     if (!record) {
       throw new Error(`Execution has not been started: ${receipt.identity.eventKey}`);
     }
@@ -82,7 +85,7 @@ export class InMemoryActionLedger implements ActionLedger {
       lifecycle: this.lifecycleFor(receipt),
       receipt,
     };
-    this.recordsByEvent.set(receipt.identity.eventKey, updated);
+    this.recordsByEvent.set(eventKey, updated);
     const records = this.recordsByAction.get(this.actionKey(receipt.identity)) ?? [];
     const index = records.findIndex((candidate) => candidate.identity.eventKey === receipt.identity.eventKey);
     if (index >= 0) {
@@ -90,8 +93,15 @@ export class InMemoryActionLedger implements ActionLedger {
     }
   }
 
-  public async replaceReceipt(expectedIdentity: ExecutionIdentity, receipt: Receipt): Promise<void> {
-    const record = this.recordsByEvent.get(expectedIdentity.eventKey);
+  public async replaceReceiptWithClaim(
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    claims: ClaimAuthority,
+    now: number,
+  ): Promise<void> {
+    await claims.assertValid(receipt.identity, now);
+    const eventKey = this.eventKey(expectedIdentity);
+    const record = this.recordsByEvent.get(eventKey);
     if (!record || !record.receipt || record.receipt.businessStatus !== "UNKNOWN") {
       throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
     }
@@ -105,16 +115,16 @@ export class InMemoryActionLedger implements ActionLedger {
       lifecycle: this.lifecycleFor(receipt),
       receipt,
     };
-    this.recordsByEvent.set(receipt.identity.eventKey, updated);
-    const records = this.recordsByAction.get(this.actionKey(receipt.identity)) ?? [];
-    const index = records.findIndex((candidate) => candidate.identity.eventKey === receipt.identity.eventKey);
+    this.recordsByEvent.set(eventKey, updated);
+    const records = this.recordsByAction.get(this.actionKey(expectedIdentity)) ?? [];
+    const index = records.findIndex((candidate) => candidate.identity.eventKey === expectedIdentity.eventKey);
     if (index >= 0) {
       records[index] = updated;
     }
   }
 
-  public async findByEventKey(eventKey: EventKey): Promise<ExecutionRecord | undefined> {
-    return this.recordsByEvent.get(eventKey);
+  public async findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined> {
+    return this.recordsByEvent.get(`${programId}:${planId}:${eventKey}`);
   }
 
   public async findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined> {
@@ -128,6 +138,10 @@ export class InMemoryActionLedger implements ActionLedger {
 
   public records(): readonly ExecutionRecord[] {
     return [...this.recordsByEvent.values()];
+  }
+
+  private eventKey(identity: ExecutionIdentity): string {
+    return `${identity.programId}:${identity.planId}:${identity.eventKey}`;
   }
 
   private actionKey(identity: ExecutionIdentity): string {

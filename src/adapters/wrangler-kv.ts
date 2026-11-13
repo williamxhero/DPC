@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import type {
   ActionDescriptor,
   Evidence,
+  ExecutionIdentity,
   NfActionRuntime,
   NfExecutionRequest,
   NfExecutionResult,
@@ -18,8 +19,13 @@ interface WranglerKvTarget {
 
 interface StoredValue {
   readonly dpcVersion: 1;
-  readonly nfTaskId: string;
+  readonly programId: string;
+  readonly planId: string;
+  readonly planRevision: string;
+  readonly actionId: string;
   readonly eventKey: string;
+  readonly nfTaskId: string;
+  readonly runGeneration: number;
   readonly value: string;
 }
 
@@ -27,6 +33,7 @@ export interface WranglerKvConfig {
   readonly namespaceId: string;
   readonly wranglerVersion?: string;
   readonly command?: string;
+  readonly runner?: (args: readonly string[]) => Promise<string>;
 }
 
 /**
@@ -38,12 +45,17 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
   private readonly namespaceId: string;
   private readonly wranglerVersion: string;
   private readonly command: string;
+  private readonly runner?: (args: readonly string[]) => Promise<string>;
 
   public constructor(config: WranglerKvConfig) {
     if (!config.namespaceId || !/^[A-Za-z0-9_-]+$/.test(config.namespaceId)) throw new Error("Wrangler KV adapter requires a safe namespaceId");
     this.namespaceId = config.namespaceId;
     this.wranglerVersion = config.wranglerVersion ?? "4.160.1";
+    if (!/^\d+\.\d+\.\d+$/.test(this.wranglerVersion)) {
+      throw new Error("Wrangler KV adapter requires a safe semantic wranglerVersion");
+    }
     this.command = config.command ?? (process.platform === "win32" ? "npx.cmd" : "npx");
+    this.runner = config.runner;
   }
 
   public async execute(request: NfExecutionRequest): Promise<NfExecutionResult> {
@@ -63,8 +75,13 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
       target.key,
       this.encode({
         dpcVersion: 1,
-        nfTaskId: request.identity.nfTaskId,
+        programId: request.identity.programId,
+        planId: request.identity.planId,
+        planRevision: request.identity.planRevision,
+        actionId: request.identity.actionId,
         eventKey: request.identity.eventKey,
+        nfTaskId: request.identity.nfTaskId,
+        runGeneration: request.identity.runGeneration,
         value: target.value,
       }),
       "--namespace-id",
@@ -81,12 +98,17 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
     return this.done(request, target, "readback");
   }
 
-  public async cleanup(action: ActionDescriptor): Promise<void> {
+  public async cleanup(action: ActionDescriptor, identity: ExecutionIdentity): Promise<void> {
     const target = this.targetFrom(action);
+    const existing = await this.get(target.key);
+    if (!existing) return;
+    if (!this.sameIdentity(existing, identity) || existing.value !== target.value) {
+      throw new Error(`Cloudflare KV cleanup refused an unowned key: ${target.key}`);
+    }
     try {
       await this.run("kv", "key", "delete", target.key, "--namespace-id", this.namespaceId, "--remote");
     } catch (error) {
-      if (!this.isMissing(error)) throw error;
+      if (!this.isMissing(error, target.key)) throw error;
     }
   }
 
@@ -95,22 +117,24 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
     try {
       output = await this.run("kv", "key", "get", key, "--namespace-id", this.namespaceId, "--remote");
     } catch (error) {
-      if (this.isMissing(error)) return undefined;
+      if (this.isMissing(error, key)) return undefined;
       throw error;
     }
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(this.decode(output));
-      if (!parsed || typeof parsed !== "object") return undefined;
-      const value = parsed as Record<string, unknown>;
-      if (value.dpcVersion !== 1 || typeof value.nfTaskId !== "string" || typeof value.eventKey !== "string" || typeof value.value !== "string") return undefined;
-      return value as unknown as StoredValue;
-    } catch {
-      return undefined;
+      parsed = JSON.parse(this.decode(output));
+    } catch (error) {
+      throw new Error(`Cloudflare KV key contains an unrecognized value: ${key}`, { cause: error });
     }
+    if (!this.isStoredValue(parsed)) {
+      throw new Error(`Cloudflare KV key contains an unrecognized value: ${key}`);
+    }
+    return parsed;
   }
 
   private async run(...args: string[]): Promise<string> {
     const childArgs = ["--yes", `wrangler@${this.wranglerVersion}`, ...args];
+    if (this.runner) return this.runner(childArgs);
     const command = process.platform === "win32" ? process.env.ComSpec ?? "cmd.exe" : this.command;
     const commandArgs = process.platform === "win32"
       ? ["/d", "/s", "/c", [this.quoteCommand(this.command), ...childArgs].join(" ")]
@@ -160,13 +184,39 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
   }
 
   private sameValue(stored: StoredValue, request: NfExecutionRequest, target: WranglerKvTarget): boolean {
-    return stored.nfTaskId === request.identity.nfTaskId && stored.eventKey === request.identity.eventKey && stored.value === target.value;
+    return this.sameIdentity(stored, request.identity) && stored.value === target.value;
   }
 
-  private isMissing(error: unknown): boolean {
+  private sameIdentity(stored: StoredValue, identity: ExecutionIdentity): boolean {
+    return stored.programId === identity.programId
+      && stored.planId === identity.planId
+      && stored.planRevision === identity.planRevision
+      && stored.actionId === identity.actionId
+      && stored.eventKey === identity.eventKey
+      && stored.nfTaskId === identity.nfTaskId
+      && stored.runGeneration === identity.runGeneration;
+  }
+
+  private isStoredValue(value: unknown): value is StoredValue {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Record<string, unknown>;
+    return candidate.dpcVersion === 1
+      && typeof candidate.programId === "string"
+      && typeof candidate.planId === "string"
+      && typeof candidate.planRevision === "string"
+      && typeof candidate.actionId === "string"
+      && typeof candidate.eventKey === "string"
+      && typeof candidate.nfTaskId === "string"
+      && typeof candidate.runGeneration === "number"
+      && Number.isInteger(candidate.runGeneration)
+      && typeof candidate.value === "string";
+  }
+
+  private isMissing(error: unknown, key: string): boolean {
     if (!error || typeof error !== "object") return false;
     const candidate = error as { stderr?: unknown; message?: unknown };
     const text = `${String(candidate.stderr ?? "")} ${String(candidate.message ?? "")}`;
-    return /\b404\b|not found/i.test(text);
+    const encodedKey = encodeURIComponent(key);
+    return text.includes(`/storage/kv/namespaces/${this.namespaceId}/values/${encodedKey} - 404: Not Found`);
   }
 }

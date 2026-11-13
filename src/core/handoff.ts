@@ -48,6 +48,14 @@ export interface HandoffBundle extends HandoffInput {
   readonly acceptedBy?: string;
 }
 
+export interface HandoffContinuationIdentity {
+  readonly programId: ProgramId;
+  readonly planId: PlanId;
+  readonly planRevision: PlanRevision;
+  readonly actionId: ActionId;
+  readonly eventKey: EventKey;
+}
+
 export interface HandoffStore {
   putOrGet(bundle: HandoffBundle): Promise<{ readonly created: boolean; readonly bundle: HandoffBundle }>;
   get(handoffId: string): Promise<HandoffBundle | undefined>;
@@ -82,7 +90,9 @@ export class HandoffCoordinator {
   public async create(input: HandoffInput): Promise<HandoffBundle> {
     const bundle: HandoffBundle = {
       ...input,
-      handoffId: `handoff:${input.eventKey}:${input.sourceRun}`,
+      handoffId: `handoff:${[input.programId, input.planId, input.eventKey, input.sourceRun]
+        .map((value) => encodeURIComponent(value))
+        .join(":")}`,
       status: this.initialStatus(input),
       createdAt: this.clock(),
       completedScope: [...input.completedScope],
@@ -97,8 +107,7 @@ export class HandoffCoordinator {
   public async readForContinuation(
     handoffId: string,
     targetHarness: string,
-    expectedPlanRevision: PlanRevision,
-    expectedActionId: ActionId,
+    expected: HandoffContinuationIdentity,
   ): Promise<HandoffBundle> {
     const bundle = await this.dependencies.store.get(handoffId);
     if (!bundle) {
@@ -107,10 +116,18 @@ export class HandoffCoordinator {
     if (bundle.status !== "READY" && bundle.status !== "ACCEPTED") {
       throw new HandoffBlockedError(`Handoff ${handoffId} is ${bundle.status}`);
     }
-    if (bundle.planRevision !== expectedPlanRevision || bundle.actionId !== expectedActionId) {
+    if (!this.sameIdentity(bundle, expected)) {
       throw new StaleWriteError(`Handoff context is stale: ${handoffId}`);
     }
     return this.dependencies.store.accept(handoffId, targetHarness, bundle);
+  }
+
+  private sameIdentity(bundle: HandoffBundle, expected: HandoffContinuationIdentity): boolean {
+    return bundle.programId === expected.programId
+      && bundle.planId === expected.planId
+      && bundle.planRevision === expected.planRevision
+      && bundle.actionId === expected.actionId
+      && bundle.eventKey === expected.eventKey;
   }
 
   private initialStatus(input: HandoffInput): HandoffStatus {
@@ -130,7 +147,11 @@ export class InMemoryHandoffStore implements HandoffStore {
   public async putOrGet(bundle: HandoffBundle): Promise<{ readonly created: boolean; readonly bundle: HandoffBundle }> {
     const existing = this.bundles.get(bundle.handoffId);
     if (existing) {
-      if (existing.planRevision !== bundle.planRevision || existing.actionId !== bundle.actionId || existing.eventKey !== bundle.eventKey) {
+      if (existing.programId !== bundle.programId
+        || existing.planId !== bundle.planId
+        || existing.planRevision !== bundle.planRevision
+        || existing.actionId !== bundle.actionId
+        || existing.eventKey !== bundle.eventKey) {
         throw new StaleWriteError(`Handoff identity conflicts: ${bundle.handoffId}`);
       }
       return { created: false, bundle: existing };
@@ -145,7 +166,12 @@ export class InMemoryHandoffStore implements HandoffStore {
 
   public async accept(handoffId: string, targetHarness: string, expected: HandoffBundle): Promise<HandoffBundle> {
     const current = this.bundles.get(handoffId);
-    if (!current || current.planRevision !== expected.planRevision || current.actionId !== expected.actionId) {
+    if (!current
+      || current.programId !== expected.programId
+      || current.planId !== expected.planId
+      || current.planRevision !== expected.planRevision
+      || current.actionId !== expected.actionId
+      || current.eventKey !== expected.eventKey) {
       throw new StaleWriteError(`Handoff changed before acceptance: ${handoffId}`);
     }
     const accepted = {

@@ -324,11 +324,19 @@ test("unknown results are recovery-only and recovery uses readback without re-ex
   assert.equal(dispatched.receipt.businessStatus, "UNKNOWN");
   assert.equal(nf.requests.length, 1);
 
-  const stillUnknown = await coreUnderTest.recover(id("trigger-unknown"));
+  const stillUnknown = await coreUnderTest.recover({
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    eventKey: id("trigger-unknown"),
+  });
   assert.equal(stillUnknown.status, "STILL_UNKNOWN");
   assert.equal(nf.requests.length, 1);
 
-  const recovered = await coreUnderTest.recover(id("trigger-unknown"));
+  const recovered = await coreUnderTest.recover({
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    eventKey: id("trigger-unknown"),
+  });
   assert.equal(recovered.status, "RECOVERED");
   assert.equal(recovered.receipt.businessStatus, "COMPLETED");
   assert.equal(nf.requests.length, 1);
@@ -496,8 +504,13 @@ test("handoff transfers a verified checkpoint without changing action identity",
   const continued = await coordinator.readForContinuation(
     created.handoffId,
     "codex",
-    id("r1"),
-    id("action-1"),
+    {
+      programId: id("program-1"),
+      planId: id("plan-1"),
+      planRevision: id("r1"),
+      actionId: id("action-1"),
+      eventKey: id("trigger-handoff"),
+    },
   );
 
   assert.equal(created.status, "READY");
@@ -532,7 +545,13 @@ test("unconfirmed, dirty, and unknown handoffs are blocked from continuation", a
   const blocked = await coordinator.create(base);
   assert.equal(blocked.status, "BLOCKED");
   await assert.rejects(
-    () => coordinator.readForContinuation(blocked.handoffId, "grok", id("r1"), id("action-1")),
+    () => coordinator.readForContinuation(blocked.handoffId, "grok", {
+      programId: id("program-1"),
+      planId: id("plan-1"),
+      planRevision: id("r1"),
+      actionId: id("action-1"),
+      eventKey: id("trigger-blocked"),
+    }),
     HandoffBlockedError,
   );
 });
@@ -564,4 +583,250 @@ test("projection drift is observable without changing the authoritative view", a
   assert.equal(drift.drifted, true);
   assert.deepEqual(drift.fields, ["revision", "authoritativeDigest"]);
   assert.deepEqual(await projection.read(id("plan-1")), original);
+});
+
+test("scopes event-key idempotency by program and plan", async () => {
+  const action = descriptor("action-1");
+  const ledger = new InMemoryActionLedger();
+  const nf = new InMemoryNfRuntime({ status: "DONE", evidence: [] });
+  const plans = {
+    read: async (programId, planId) => ({
+      programId,
+      planId,
+      revision: id("r1"),
+      profileInput: {},
+    }),
+  };
+  const coreUnderTest = new DpcCore({
+    plans,
+    ledger,
+    nf,
+    profile: new InMemoryProfile([action]),
+    claims: new NoopClaimAuthority(),
+    clock: () => 1000,
+  });
+
+  const first = await coreUnderTest.dispatch({
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    eventKey: id("shared-event"),
+  });
+  const second = await coreUnderTest.dispatch({
+    programId: id("program-2"),
+    planId: id("plan-2"),
+    eventKey: id("shared-event"),
+  });
+
+  assert.equal(first.status, "DISPATCHED");
+  assert.equal(second.status, "DISPATCHED");
+  assert.equal(second.identity.programId, "program-2");
+  assert.equal(nf.requests.length, 2);
+});
+
+test("releases the claim and wraps a ledger begin failure", async () => {
+  const action = descriptor("action-1");
+  const ledger = new InMemoryActionLedger();
+  const originalBegin = ledger.beginExecution.bind(ledger);
+  let failOnce = true;
+  ledger.beginExecution = async (...args) => {
+    if (failOnce) {
+      failOnce = false;
+      throw new Error("ledger unavailable");
+    }
+    return originalBegin(...args);
+  };
+  const nf = new InMemoryNfRuntime({ status: "DONE", evidence: [] });
+  const coreUnderTest = new DpcCore({
+    plans: new InMemoryPlanSource(plan([action])),
+    ledger,
+    nf,
+    profile: new InMemoryProfile([action]),
+    claims: new InMemoryClaimAuthority(30_000, () => 1000),
+    clock: () => 1000,
+  });
+
+  await assert.rejects(
+    () => coreUnderTest.dispatch({
+      programId: id("program-1"),
+      planId: id("plan-1"),
+      eventKey: id("begin-failure"),
+    }),
+    (error) => error instanceof DpcAdapterError && error.message.includes("begin execution"),
+  );
+  const retried = await coreUnderTest.dispatch({
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    eventKey: id("begin-retry"),
+  });
+
+  assert.equal(retried.status, "DISPATCHED");
+  assert.equal(nf.requests.length, 1);
+});
+
+test("recovery rereads the current plan revision before selecting the next action", async () => {
+  const first = descriptor("action-1");
+  const second = descriptor("action-2", ["action-1"]);
+  const source = new InMemoryPlanSource(plan([first, second], "r1"));
+  const ledger = new InMemoryActionLedger();
+  const claims = new InMemoryClaimAuthority(30_000, () => 1000);
+  const coreUnderTest = new DpcCore({
+    plans: source,
+    ledger,
+    nf: new InMemoryNfRuntime((request) => ({ status: "UNKNOWN", evidence: [], identity: request.identity })),
+    recovery: {
+      readback: async (request) => {
+        source.setRevision(id("r2"));
+        return { status: "DONE", evidence: [], identity: request.identity };
+      },
+    },
+    profile: new InMemoryProfile([first, second]),
+    claims,
+    clock: () => 1000,
+  });
+  const request = {
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    eventKey: id("recovery-revision"),
+  };
+
+  await coreUnderTest.dispatch(request);
+  const recovered = await coreUnderTest.recover(request);
+
+  assert.equal(recovered.status, "RECOVERED");
+  assert.equal(recovered.planRevision, "r2");
+  assert.equal(recovered.nextAction.actionId, "action-2");
+});
+
+test("does not append a receipt after the claim expires during atomic write", async () => {
+  const action = descriptor("action-1");
+  const ledger = new InMemoryActionLedger();
+  const originalWrite = ledger.appendReceiptWithClaim.bind(ledger);
+  let now = 1000;
+  ledger.appendReceiptWithClaim = async (receipt, claims, _writeNow) => {
+    now = 1011;
+    return originalWrite(receipt, claims, now);
+  };
+  const coreUnderTest = new DpcCore({
+    plans: new InMemoryPlanSource(plan([action])),
+    ledger,
+    nf: new InMemoryNfRuntime({ status: "DONE", evidence: [] }),
+    profile: new InMemoryProfile([action]),
+    claims: new InMemoryClaimAuthority(10, () => now),
+    clock: () => now,
+  });
+
+  await assert.rejects(
+    () => coreUnderTest.dispatch({
+      programId: id("program-1"),
+      planId: id("plan-1"),
+      eventKey: id("expired-write"),
+    }),
+    StaleWriteError,
+  );
+  assert.equal(ledger.records()[0].receipt, undefined);
+});
+
+test("rejects every stale stable identity component returned by NF", async () => {
+  const fields = ["programId", "planId", "planRevision", "actionId", "eventKey", "nfTaskId", "runGeneration", "claimFence"];
+  for (const field of fields) {
+    const action = descriptor("action-1");
+    const ledger = new InMemoryActionLedger();
+    const claims = new InMemoryClaimAuthority(30_000, () => 1000);
+    const coreUnderTest = new DpcCore({
+      plans: new InMemoryPlanSource(plan([action])),
+      ledger,
+      nf: new InMemoryNfRuntime((request) => ({
+        status: "DONE",
+        evidence: [],
+        identity: {
+          ...request.identity,
+          [field]: field === "runGeneration" || field === "claimFence"
+            ? 0
+            : field === "eventKey" ? "returned-event-key" : `stale-${field}`,
+        },
+      })),
+      profile: new InMemoryProfile([action]),
+      claims,
+      clock: () => 1000,
+    });
+
+    await assert.rejects(
+      () => coreUnderTest.dispatch({
+        programId: id("program-1"),
+        planId: id("plan-1"),
+        eventKey: id(`stale-${field}`),
+      }),
+      StaleWriteError,
+      field,
+    );
+    assert.equal(ledger.records()[0].receipt, undefined, field);
+  }
+});
+
+test("reclaims an expired wake lease left in CLAIMED", async () => {
+  let now = 1000;
+  const store = new InMemoryWakeStore(10, () => now);
+  const coordinator = new WakeCoordinator({ store, clock: () => now });
+  const scheduled = await coordinator.schedule({
+    dedupeKey: id("expired-claim"),
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    planRevision: id("r1"),
+    triggerType: "RECOVERY",
+    notBefore: 1000,
+    fallbackPolicy: "manual",
+  });
+  const first = await coordinator.claim(scheduled.intent.wakeId, "owner-a", 1000);
+  now = 1011;
+  const second = await coordinator.claim(scheduled.intent.wakeId, "owner-b", 1011);
+
+  assert.equal(first.fence, 1);
+  assert.equal(second.fence, 2);
+});
+
+test("handoff identity cannot alias across program and plan contexts", async () => {
+  const coordinator = new HandoffCoordinator({ store: new InMemoryHandoffStore(), clock: () => 1000 });
+  const base = {
+    programId: id("program-a"),
+    planId: id("plan-a"),
+    planRevision: id("r1"),
+    actionId: id("action-1"),
+    eventKey: id("shared-handoff-event"),
+    sourceHarness: "claude",
+    sourceRun: "shared-run",
+    currentStatus: "RUNNING",
+    completedScope: [],
+    remainingScope: ["continue"],
+    acceptanceReferences: [],
+    authorizationReferences: [],
+    evidenceReferences: [],
+    lastCheckpoint: "checkpoint-1",
+    nextAction: "continue",
+    unknownExternalResult: "NONE",
+    workspace: { mode: "read-only", state: "CLEAN" },
+    checkpointConfirmed: true,
+    deliveryState: "CONFIRMED",
+  };
+  const first = await coordinator.create(base);
+  const second = await coordinator.create({ ...base, programId: id("program-b"), planId: id("plan-b") });
+  const continued = await coordinator.readForContinuation(first.handoffId, "codex", {
+    programId: base.programId,
+    planId: base.planId,
+    planRevision: base.planRevision,
+    actionId: base.actionId,
+    eventKey: base.eventKey,
+  });
+
+  assert.notEqual(first.handoffId, second.handoffId);
+  assert.equal(continued.programId, "program-a");
+  await assert.rejects(
+    () => coordinator.readForContinuation(first.handoffId, "grok", {
+      programId: id("program-b"),
+      planId: id("plan-b"),
+      planRevision: base.planRevision,
+      actionId: base.actionId,
+      eventKey: base.eventKey,
+    }),
+    StaleWriteError,
+  );
 });

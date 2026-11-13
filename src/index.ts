@@ -15,6 +15,7 @@ export type {
   CheckpointMode,
   DeliveryState,
   HandoffBundle,
+  HandoffContinuationIdentity,
   HandoffInput,
   HandoffStatus,
   UnknownExternalResult,

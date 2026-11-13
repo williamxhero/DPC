@@ -1,6 +1,7 @@
 import type {
   ActionDescriptor,
   Evidence,
+  ExecutionIdentity,
   NfActionRuntime,
   NfExecutionRequest,
   NfExecutionResult,
@@ -14,8 +15,13 @@ interface CloudflareKvTarget {
 
 interface StoredValue {
   readonly dpcVersion: 1;
-  readonly nfTaskId: string;
+  readonly programId: string;
+  readonly planId: string;
+  readonly planRevision: string;
+  readonly actionId: string;
   readonly eventKey: string;
+  readonly nfTaskId: string;
+  readonly runGeneration: number;
   readonly value: string;
 }
 
@@ -43,12 +49,16 @@ export interface CloudflareKvConfig {
  * key as the external effect, stores the DPC identity in the value, and only
  * overwrites a value when the same identity is replayed.
  */
+const CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4";
+
 export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapter {
   private readonly baseUrl: string;
   private readonly fetcher: FetchLike;
 
   public constructor(config: CloudflareKvConfig, fetcher?: FetchLike) {
-    this.baseUrl = (config.baseUrl ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
+    const baseUrl = (config.baseUrl ?? CLOUDFLARE_API_BASE_URL).replace(/\/$/, "");
+    this.validateBaseUrl(baseUrl, fetcher !== undefined);
+    this.baseUrl = baseUrl;
     this.fetcher = fetcher ?? (globalThis.fetch as unknown as FetchLike);
     if (!config.accountId || !config.namespaceId || !config.apiToken) {
       throw new Error("Cloudflare KV adapter requires accountId, namespaceId, and apiToken");
@@ -74,8 +84,13 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
 
     const stored: StoredValue = {
       dpcVersion: 1,
-      nfTaskId: request.identity.nfTaskId,
+      programId: request.identity.programId,
+      planId: request.identity.planId,
+      planRevision: request.identity.planRevision,
+      actionId: request.identity.actionId,
       eventKey: request.identity.eventKey,
+      nfTaskId: request.identity.nfTaskId,
+      runGeneration: request.identity.runGeneration,
       value: target.value,
     };
     await this.put(target.key, stored);
@@ -89,8 +104,13 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
     return this.done(request, target, "readback");
   }
 
-  public async cleanup(action: ActionDescriptor): Promise<void> {
+  public async cleanup(action: ActionDescriptor, identity: ExecutionIdentity): Promise<void> {
     const target = this.targetFrom(action);
+    const existing = await this.get(target.key);
+    if (!existing) return;
+    if (!this.sameIdentity(existing, identity) || existing.value !== target.value) {
+      throw new Error(`Cloudflare KV cleanup refused an unowned key: ${target.key}`);
+    }
     const response = await this.fetcher(this.url(target.key), {
       method: "DELETE",
       headers: this.headers(),
@@ -108,17 +128,16 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
     if (response.status === 404) return undefined;
     if (!response.ok) throw new Error(`Cloudflare KV read failed with status ${response.status}`);
     const body = await response.text();
+    let parsed: unknown;
     try {
-      const parsed: unknown = JSON.parse(body);
-      if (!parsed || typeof parsed !== "object") return undefined;
-      const value = parsed as Record<string, unknown>;
-      if (value.dpcVersion !== 1 || typeof value.nfTaskId !== "string" || typeof value.eventKey !== "string" || typeof value.value !== "string") {
-        return undefined;
-      }
-      return value as unknown as StoredValue;
-    } catch {
-      return undefined;
+      parsed = JSON.parse(body);
+    } catch (error) {
+      throw new Error(`Cloudflare KV key contains an unrecognized value: ${key}`, { cause: error });
     }
+    if (!this.isStoredValue(parsed)) {
+      throw new Error(`Cloudflare KV key contains an unrecognized value: ${key}`);
+    }
+    return parsed;
   }
 
   private async put(key: string, value: StoredValue): Promise<void> {
@@ -168,9 +187,48 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
   }
 
   private sameValue(stored: StoredValue, request: NfExecutionRequest, target: CloudflareKvTarget): boolean {
-    return stored.nfTaskId === request.identity.nfTaskId
-      && stored.eventKey === request.identity.eventKey
+    return this.sameIdentity(stored, request.identity)
       && stored.value === target.value;
+  }
+
+  private sameIdentity(stored: StoredValue, identity: ExecutionIdentity): boolean {
+    return stored.programId === identity.programId
+      && stored.planId === identity.planId
+      && stored.planRevision === identity.planRevision
+      && stored.actionId === identity.actionId
+      && stored.eventKey === identity.eventKey
+      && stored.nfTaskId === identity.nfTaskId
+      && stored.runGeneration === identity.runGeneration;
+  }
+
+  private isStoredValue(value: unknown): value is StoredValue {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Record<string, unknown>;
+    return candidate.dpcVersion === 1
+      && typeof candidate.programId === "string"
+      && typeof candidate.planId === "string"
+      && typeof candidate.planRevision === "string"
+      && typeof candidate.actionId === "string"
+      && typeof candidate.eventKey === "string"
+      && typeof candidate.nfTaskId === "string"
+      && typeof candidate.runGeneration === "number"
+      && Number.isInteger(candidate.runGeneration)
+      && typeof candidate.value === "string";
+  }
+
+  private validateBaseUrl(baseUrl: string, hasInjectedFetcher: boolean): void {
+    let parsed: URL;
+    try {
+      parsed = new URL(baseUrl);
+    } catch {
+      throw new Error("Cloudflare KV baseUrl must be a valid URL");
+    }
+    if (parsed.protocol !== "https:") {
+      throw new Error("Cloudflare KV baseUrl must use HTTPS");
+    }
+    if (!hasInjectedFetcher && baseUrl !== CLOUDFLARE_API_BASE_URL) {
+      throw new Error("Cloudflare KV baseUrl must be the official API origin");
+    }
   }
 
   private url(key: string): string {

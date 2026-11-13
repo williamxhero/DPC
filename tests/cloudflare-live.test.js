@@ -66,18 +66,21 @@ test("T7 Cloudflare KV action performs a real write, readback, duplicate check, 
     eventKey: id(`cloudflare-event-${randomUUID()}`),
   };
 
+  let effectIdentity;
   try {
     const dispatched = await core.dispatch(request);
+    effectIdentity = dispatched.identity;
     assert.equal(dispatched.status, "DISPATCHED");
     assert.equal(dispatched.receipt.businessStatus, "UNKNOWN");
 
     let recovered;
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      recovered = await core.recover(request.eventKey);
+      recovered = await core.recover(request);
       if (recovered.status === "RECOVERED") break;
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     assert.equal(recovered.status, "RECOVERED");
+    effectIdentity = recovered.identity;
     assert.equal(recovered.receipt.nfStatus, "DONE");
     assert.equal(recovered.receipt.businessStatus, "COMPLETED");
     assert.equal(executeCalls, 1);
@@ -109,8 +112,13 @@ test("T7 Cloudflare KV action performs a real write, readback, duplicate check, 
     const continued = await handoff.readForContinuation(
       bundle.handoffId,
       "codex",
-      plan.revision,
-      action.actionId,
+      {
+        programId: plan.programId,
+        planId: plan.planId,
+        planRevision: plan.revision,
+        actionId: action.actionId,
+        eventKey: request.eventKey,
+      },
     );
     assert.equal(continued.status, "ACCEPTED");
     assert.equal(continued.acceptedBy, "codex");
@@ -119,6 +127,10 @@ test("T7 Cloudflare KV action performs a real write, readback, duplicate check, 
     assert.equal(duplicate.status, "DUPLICATE");
     assert.equal(executeCalls, 1);
   } finally {
-    await runtime.cleanup(action);
+    if (effectIdentity) {
+      await runtime.cleanup(action, effectIdentity);
+      const afterCleanup = await runtime.readback({ identity: effectIdentity, plan, action });
+      assert.equal(afterCleanup, undefined);
+    }
   }
 });

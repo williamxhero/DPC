@@ -158,9 +158,20 @@ export interface PlanSource {
 
 export interface ActionLedger {
   beginExecution(identity: ExecutionIdentity, action: ActionDescriptor): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }>;
-  appendReceipt(receipt: Receipt): Promise<void>;
-  replaceReceipt(expectedIdentity: ExecutionIdentity, receipt: Receipt): Promise<void>;
-  findByEventKey(eventKey: EventKey): Promise<ExecutionRecord | undefined>;
+  /**
+   * Implementations must validate the claim and mutate the receipt in one
+   * compare-and-write transaction. The in-memory adapter performs both steps
+   * without an intervening await; durable adapters must use their storage CAS
+   * or transaction equivalent.
+   */
+  appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void>;
+  replaceReceiptWithClaim(
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    claims: ClaimAuthority,
+    now: number,
+  ): Promise<void>;
+  findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined>;
   findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined>;
   hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean>;
 }
@@ -202,6 +213,12 @@ export interface DispatchRequest {
   /** A stable caller-supplied trigger identity. Repeating it is idempotent. */
   readonly eventKey: EventKey;
   readonly now?: number;
+}
+
+export interface RecoveryRequest {
+  readonly programId: ProgramId;
+  readonly planId: PlanId;
+  readonly eventKey: EventKey;
 }
 
 export type DispatchResult =

@@ -1,6 +1,6 @@
 # DPC
 
-Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. The repository currently implements the first in-memory vertical slice plus T2 claim/recovery, T4 wake coordination, T5 handoff, and T6 Standard Kit/projection rules; durable persistence and a real external action are later tickets.
+Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. T1–T6 are implemented and verified, and the T7 Cloudflare provider-side-effect preflight has passed. The strict real NF A-B-C T7 acceptance and durable persistence remain blocked/future work.
 
 ## Runtime choice
 
@@ -56,7 +56,7 @@ Run only against a disposable namespace:
 npm run test:cloudflare
 ```
 
-The test creates a unique key, writes it, forces an `UNKNOWN` result, resolves it by Cloudflare readback without re-executing the write, verifies duplicate dispatch, transfers the same action through a handoff checkpoint, and deletes the key in a `finally` block. A skipped test is not T7 evidence; the live run must succeed and the namespace readback must confirm cleanup.
+The test creates a unique key, writes it, forces an `UNKNOWN` result, resolves it by Cloudflare readback without re-executing the write, verifies duplicate dispatch, accepts the same-action handoff checkpoint, deletes the key in a `finally` block, and verifies remote readback is absent afterward. This is provider-side-effect preflight evidence, not real NF A-B-C T7 evidence. A skipped test is not current provider evidence; the live run must succeed and the namespace readback must confirm cleanup.
 
 ## Standard Kit and projection isolation
 
@@ -76,11 +76,11 @@ The test creates a unique key, writes it, forces an `UNKNOWN` result, resolves i
 
 T2 adds an injected `ClaimAuthority` seam. A production implementation will own leases and fencing; `InMemoryClaimAuthority` provides the same observable contract for tests. A successful claim replaces the provisional fence with a monotonically increasing fence. Receipt writeback first validates the current fence, and a runtime result may echo its full identity; an old generation, revision, task, or fence is rejected as `StaleWriteError` rather than accepted as success.
 
-An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.recover(eventKey)` calls only the injected `RecoveryAdapter.readback` seam and never calls `NfActionRuntime.execute`. An absent readback remains `STILL_UNKNOWN`; a confirmed readback replaces the unknown receipt under a fresh fence. This keeps recovery separate from potentially duplicate side-effecting execution.
+An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.recover({ programId, planId, eventKey })` calls only the injected `RecoveryAdapter.readback` seam and never calls `NfActionRuntime.execute`. An absent readback remains `STILL_UNKNOWN`; a confirmed readback replaces the unknown receipt under a fresh fence, then rereads the current plan revision before selecting a next action. Receipt append/replace uses a claim-aware compare-and-write seam so a claim expiring during the write cannot leave a committed receipt with a stale result. This keeps recovery separate from potentially duplicate side-effecting execution.
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and `recover` seams with in-memory adapters. They cover normal sequential selection, dependency and time gates, post-action plan revision readback, duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, and recovery-only unknown handling. Durable persistence and crash-window reconciliation remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory and real-side-effect adapters. The current local suite has 37 tests: 36 pass and the opt-in live Cloudflare test is skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, and local reparse-point confinement. Durable persistence and crash-window reconciliation remain future work.
 
 ## Commands
 

@@ -147,7 +147,7 @@ export class InMemoryWakeStore implements WakeStore {
 
   public async listReady(now: number): Promise<readonly WakeIntent[]> {
     return [...this.intents.values()]
-      .filter((intent) => intent.status === "PENDING" && intent.notBefore <= now)
+      .filter((intent) => this.isReadyToClaim(intent, now))
       .sort((left, right) => left.notBefore - right.notBefore || left.wakeId.localeCompare(right.wakeId));
   }
 
@@ -157,7 +157,7 @@ export class InMemoryWakeStore implements WakeStore {
     if (current && current.expiresAt > now) {
       throw new ClaimConflictError(`Wake ${wakeId} is claimed by ${current.claim.ownerId}`);
     }
-    if (intent.status !== "PENDING" && intent.status !== "UNKNOWN") {
+    if (!this.isReadyToClaim(intent, now)) {
       throw new ClaimConflictError(`Wake ${wakeId} is not claimable in ${intent.status}`);
     }
 
@@ -192,6 +192,14 @@ export class InMemoryWakeStore implements WakeStore {
 
   public async get(wakeId: WakeId): Promise<WakeIntent | undefined> {
     return this.intents.get(wakeId);
+  }
+
+  private isReadyToClaim(intent: WakeIntent, now: number): boolean {
+    if (intent.notBefore > now) return false;
+    if (intent.status === "PENDING" || intent.status === "UNKNOWN") return true;
+    if (intent.status !== "CLAIMED") return false;
+    const lease = this.leases.get(intent.wakeId);
+    return lease !== undefined && lease.expiresAt <= now;
   }
 
   private require(wakeId: WakeId): WakeIntent {

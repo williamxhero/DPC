@@ -18,6 +18,7 @@ import {
   type Profile,
   type Receipt,
   RecoveryError,
+  type RecoveryRequest,
   type RecoveryResult,
   StaleWriteError,
 } from "./types.js";
@@ -56,7 +57,11 @@ export class DpcCore {
     const descriptors = this.readDescriptors(plan);
     this.validateDescriptors(descriptors);
 
-    const duplicate = await this.dependencies.ledger.findByEventKey(request.eventKey);
+    const duplicate = await this.dependencies.ledger.findByEventKey(
+      request.programId,
+      request.planId,
+      request.eventKey,
+    );
     if (duplicate) {
       return this.duplicateResult(duplicate, plan, descriptors, request.now ?? this.clock());
     }
@@ -74,7 +79,13 @@ export class DpcCore {
       previous?.identity.runGeneration ?? INITIAL_RUN_GENERATION - 1,
     );
     const claimed = await this.claim(identity, request.now ?? this.clock());
-    const started = await this.dependencies.ledger.beginExecution(claimed, action);
+    let started;
+    try {
+      started = await this.dependencies.ledger.beginExecution(claimed, action);
+    } catch (error) {
+      await this.release(claimed);
+      throw new DpcAdapterError(`Failed to begin execution for ${action.actionId}`, error);
+    }
     if (!started.created) {
       await this.release(claimed);
       return this.duplicateResult(started.record, plan, descriptors, request.now ?? this.clock());
@@ -124,12 +135,16 @@ export class DpcCore {
    * Resolve an UNKNOWN receipt by readback only. This method never invokes the
    * NF execute seam, so callers cannot accidentally repeat a side effect.
    */
-  public async recover(eventKey: import("./types.js").EventKey): Promise<RecoveryResult> {
-    const record = await this.dependencies.ledger.findByEventKey(eventKey);
+  public async recover(request: RecoveryRequest): Promise<RecoveryResult> {
+    const record = await this.dependencies.ledger.findByEventKey(
+      request.programId,
+      request.planId,
+      request.eventKey,
+    );
     if (!record) {
-      throw new RecoveryError(`No execution exists for ${eventKey}`);
+      throw new RecoveryError(`No execution exists for ${request.eventKey}`);
     }
-    const plan = await this.readPlan(record.identity.programId, record.identity.planId);
+    const plan = await this.readPlan(request.programId, request.planId);
     if (!record.receipt || record.receipt.businessStatus !== "UNKNOWN") {
       return {
         status: "NOT_RECOVERABLE",
@@ -164,29 +179,34 @@ export class DpcCore {
       const receipt = await this.claims.withValidClaim(claimed, async () => {
         const gate = this.checkGate(plan, record.action, result);
         const interpretation = this.interpret(plan, record.action, result, gate);
-        const nextReceipt = this.createReceipt(claimed, record.action, result, interpretation);
-        await this.dependencies.ledger.replaceReceipt(record.identity, nextReceipt);
-        return nextReceipt;
+        return this.createReceipt(claimed, record.action, result, interpretation);
       });
+      await this.dependencies.ledger.replaceReceiptWithClaim(
+        record.identity,
+        receipt,
+        this.claims,
+        this.clock(),
+      );
       await this.release(claimed);
       released = true;
 
+      const currentPlan = await this.readPlan(request.programId, request.planId);
       if (receipt.businessStatus === "UNKNOWN") {
         return {
           status: "STILL_UNKNOWN",
-          planRevision: plan.revision,
+          planRevision: currentPlan.revision,
           identity: claimed,
           receipt,
         };
       }
-      const descriptors = this.readDescriptors(plan);
+      const descriptors = this.readDescriptors(currentPlan);
       this.validateDescriptors(descriptors);
       return {
         status: "RECOVERED",
-        planRevision: plan.revision,
+        planRevision: currentPlan.revision,
         identity: claimed,
         receipt,
-        nextAction: await this.selectAction(plan, descriptors, this.clock()),
+        nextAction: await this.selectAction(currentPlan, descriptors, this.clock()),
       };
     } catch (error) {
       if (!released) {
@@ -195,7 +215,7 @@ export class DpcCore {
       if (error instanceof RecoveryError || error instanceof StaleWriteError || error instanceof DpcAdapterError) {
         throw error;
       }
-      throw new DpcAdapterError(`Recovery failed for ${eventKey}`, error);
+      throw new DpcAdapterError(`Recovery failed for ${request.eventKey}`, error);
     }
   }
 
@@ -327,11 +347,16 @@ export class DpcCore {
       const message = error instanceof Error ? error.message : "Unknown NF adapter error";
       const failed: NfExecutionResult = { status: "FAILED", evidence: [], error: message };
       try {
-        await this.claims.withValidClaim(identity, async () => {
+        const failureReceipt = await this.claims.withValidClaim(identity, async () => {
           const gate = this.checkGate(plan, action, failed);
           const interpretation = this.interpret(plan, action, failed, gate);
-          await this.dependencies.ledger.appendReceipt(this.createReceipt(identity, action, failed, interpretation));
+          return this.createReceipt(identity, action, failed, interpretation);
         });
+        await this.dependencies.ledger.appendReceiptWithClaim(
+          failureReceipt,
+          this.claims,
+          this.clock(),
+        );
       } catch (recordingError) {
         throw new DpcAdapterError("NF adapter failed and failure receipt could not be recorded", recordingError);
       }
@@ -354,17 +379,18 @@ export class DpcCore {
     action: ActionDescriptor,
     result: NfExecutionResult,
   ): Promise<Receipt> {
-    return this.claims.withValidClaim(identity, async () => {
+    const receipt = await this.claims.withValidClaim(identity, async () => {
       const gate = this.checkGate(plan, action, result);
       const interpretation = this.interpret(plan, action, result, gate);
-      const receipt = this.createReceipt(identity, action, result, interpretation);
-      try {
-        await this.dependencies.ledger.appendReceipt(receipt);
-      } catch (error) {
-        throw new DpcAdapterError("Failed to write the action receipt", error);
-      }
-      return receipt;
+      return this.createReceipt(identity, action, result, interpretation);
     });
+    try {
+      await this.dependencies.ledger.appendReceiptWithClaim(receipt, this.claims, this.clock());
+    } catch (error) {
+      if (error instanceof StaleWriteError) throw error;
+      throw new DpcAdapterError("Failed to write the action receipt", error);
+    }
+    return receipt;
   }
 
   private checkGate(plan: PlanSnapshot, action: ActionDescriptor, result: NfExecutionResult) {

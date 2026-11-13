@@ -5,7 +5,7 @@
 - 来源：GitHub Issue [#1](https://github.com/williamxhero/DPC/issues/1)
 - 架构输入：[执行报告](#1-reprot.md)
 - 版本：`plan-execution-nf-boundary-v2`
-- 本地状态：`to-spec` 已完成；T1 已实现并通过本地验证；T2–T7 仍按依赖 frontier 排队
+- 本地状态：`to-spec` 已完成；T1–T6 已实现并通过验证；T7 provider-side-effect preflight 已完成；T7 real NF A-B-C acceptance 仍阻塞；父 SPEC exit gate 未通过
 - 目标仓库：`williamxhero/DPC`
 - 外部拥有者：Needs Forever / NF Action Runtime（本 SPEC 不直接修改）
 
@@ -135,9 +135,9 @@ SPEC exit gate 只有在下列证据全部可读回时才通过：
 - T4 增加统一 `WakeIntent`、dedupe、lease/fence、pull-first resolve/claim/ack/writeback 和单一 canonical schedule seam。
 - T5 增加 provider-neutral handoff bundle、checkpoint mode、workspace/Stop/delivery blocked/unknown 状态和同 action readback。
 - T6 增加 Standard Kit profile conformance checks、只读 projection adapter 与 drift report；Claim Authority 不暴露业务 ledger/projection 写接口。
-- 验证：`npm test` 通过（18/18）；`npm run check` 通过。
+- 验证：`npm test` 通过（36 passed，1 skipped；共 37 tests）；`npm run check` 通过。live Cloudflare preflight 需显式启用，并与真实 NF A-B-C T7 分开计证。
 - 增加 `LocalFileEffectRuntime` 作为安全的本机真实副作用前置 adapter：临时目录写入、幂等 marker、readback、cleanup、路径越界拒绝；本机测试验证真实写入、重复 dispatch 和 unknown readback recovery。
-- 增加 `CloudflareKvEffectRuntime` 与使用本机 Wrangler OAuth 的 `WranglerKvEffectRuntime`；opt-in live test 使用唯一 KV key、identity envelope、unknown readback recovery、duplicate dispatch、同 action handoff 和 finally cleanup。Wrangler 已认证，专用 `DPC_T7_ACCEPTANCE` namespace 的 live write/readback/recovery/handoff/cleanup 已通过，测试后 namespace 为空。
+- 增加 `CloudflareKvEffectRuntime` 与使用本机 Wrangler OAuth 的 `WranglerKvEffectRuntime`；opt-in live test 使用唯一 KV key、完整稳定 identity envelope、unknown readback recovery、duplicate dispatch、同 action handoff checkpoint 和 finally cleanup readback。Wrangler 已认证，专用 `DPC_T7_ACCEPTANCE` namespace 的 provider-side-effect preflight 已通过，测试后 namespace 为空；该证据不替代真实 NF A-B-C T7。
 - 当前工作树未提交；未推送远程，也未声称父 SPEC exit gate 已通过。
 
 ## 当前阻塞与决策记录

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -64,10 +64,42 @@ test("local file adapter performs a real write, readback, idempotent replay, and
     assert.equal(await readFile(target, "utf8"), "DPC local side effect\n");
     assert.equal(first.identity.eventKey, "local-event");
 
-    await runtime.cleanup(action);
+    await runtime.cleanup(action, identity);
     await assert.rejects(() => readFile(target, "utf8"));
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local file adapter rejects symlink and junction traversal", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "dpc-local-confinement-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "dpc-local-outside-"));
+  try {
+    await symlink(outside, path.join(root, "link"), process.platform === "win32" ? "junction" : "dir");
+    const action = {
+      ...localAction(),
+      target: { relativePath: "link/escape.txt", content: "must stay inside" },
+    };
+    const identity = {
+      programId: id("program-local"),
+      planId: id("plan-local"),
+      planRevision: id("r1"),
+      actionId: id("local-write"),
+      eventKey: id("confinement-event"),
+      nfTaskId: id("nf:confinement-event:local-write"),
+      runGeneration: 1,
+      claimFence: 1,
+    };
+    const runtime = new LocalFileEffectRuntime(root);
+
+    await assert.rejects(
+      () => runtime.execute({ identity, plan: localPlan(action), action }),
+      /symbolic link or junction/,
+    );
+    await assert.rejects(() => readFile(path.join(outside, "escape.txt"), "utf8"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
@@ -103,7 +135,7 @@ test("DPC recovers an unknown local submission through readback without executin
     };
 
     const first = await core.dispatch(request);
-    const recovered = await core.recover(request.eventKey);
+    const recovered = await core.recover(request);
     const target = path.join(root, "evidence", "result.txt");
 
     assert.equal(first.receipt.businessStatus, "UNKNOWN");
