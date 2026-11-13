@@ -5,7 +5,7 @@
 - 来源：GitHub Issue [#1](https://github.com/williamxhero/DPC/issues/1)
 - 架构输入：[执行报告](#1-reprot.md)
 - 版本：`plan-execution-nf-boundary-v2`
-- 本地状态：`to-spec` 已完成；T1–T6 已实现并通过验证；T7 provider-side-effect preflight 已完成；T7 real NF A-B-C acceptance 仍阻塞；父 SPEC exit gate 未通过
+- 本地状态：`to-spec` 已完成；T1–T6 已实现并通过验证；T7 provider-side-effect preflight 与真实 Needs Forever unknown-recovery acceptance 已完成；父 SPEC exit gate 证据已具备，待 tracker 关闭。
 - 目标仓库：`williamxhero/DPC`
 - 外部拥有者：Needs Forever / NF Action Runtime（本 SPEC 不直接修改）
 
@@ -135,10 +135,11 @@ SPEC exit gate 只有在下列证据全部可读回时才通过：
 - T4 增加统一 `WakeIntent`、dedupe、lease/fence、pull-first resolve/claim/ack/writeback 和单一 canonical schedule seam。
 - T5 增加 provider-neutral handoff bundle、checkpoint mode、workspace/Stop/delivery blocked/unknown 状态和同 action readback。
 - T6 增加 Standard Kit profile conformance checks、只读 projection adapter 与 drift report；Claim Authority 不暴露业务 ledger/projection 写接口。
-- 验证：`npm test` 通过（36 passed，1 skipped；共 37 tests）；`npm run check` 通过。live Cloudflare preflight 需显式启用，并与真实 NF A-B-C T7 分开计证。
+- 验证：`npm test` 通过（38 passed，2 skipped；共 40 tests）；`npm run check` 通过。Cloudflare 与 Needs Forever live acceptance 均需显式启用，并分别保存 provider-side-effect 与真实 NF unknown-recovery 证据。
 - 增加 `LocalFileEffectRuntime` 作为安全的本机真实副作用前置 adapter：临时目录写入、幂等 marker、readback、cleanup、路径越界拒绝；本机测试验证真实写入、重复 dispatch 和 unknown readback recovery。
-- 增加 `CloudflareKvEffectRuntime` 与使用本机 Wrangler OAuth 的 `WranglerKvEffectRuntime`；opt-in live test 使用唯一 KV key、完整稳定 identity envelope、unknown readback recovery、duplicate dispatch、同 action handoff checkpoint 和 finally cleanup readback。Wrangler 已认证，专用 `DPC_T7_ACCEPTANCE` namespace 的 provider-side-effect preflight 已通过，测试后 namespace 为空；该证据不替代真实 NF A-B-C T7。
-- 当前工作树未提交；未推送远程，也未声称父 SPEC exit gate 已通过。
+- 增加 `CloudflareKvEffectRuntime` 与使用本机 Wrangler OAuth 的 `WranglerKvEffectRuntime`；opt-in live test 使用唯一 KV key、完整稳定 identity envelope、unknown readback recovery、duplicate dispatch、同 action handoff checkpoint 和 finally cleanup readback。Wrangler 已认证，专用 `DPC_T7_ACCEPTANCE` namespace 的 provider-side-effect preflight 已通过，测试后 namespace 为空。
+- 增加 `NeedsForeverLocalFileRuntime` 与 `tests/needs-forever-live.test.js`；通过本机已认证的 `needs-forever` `control.mjs` 启动真实 disposable independent-worker NF path，在独立临时 workspace 产生真实文件副作用，DPC 以观测超时记录 `UNKNOWN`，再通过 readback 确认结果而不重新启动 NF，验证 duplicate dispatch、same-action handoff、next-action selection 与 cleanup。该测试未使用 simulated fixture，也未修改 Needs Forever 仓库。
+- 当前工作树的前一基线已提交并推送；本次真实 NF acceptance 变更需在验证完成后提交并推送。父 SPEC exit gate 的真实副作用、receipt、readback、recovery、duplicate、handoff 和 next-action 证据已形成，准备更新 tracker。
 
 ## 当前阻塞与决策记录
 

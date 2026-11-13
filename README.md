@@ -1,6 +1,6 @@
 # DPC
 
-Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. T1–T6 are implemented and verified, and the T7 Cloudflare provider-side-effect preflight has passed. The strict real NF A-B-C T7 acceptance and durable persistence remain blocked/future work.
+Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. T1–T6 are implemented and verified, the T7 Cloudflare provider-side-effect preflight has passed, and the real Needs Forever unknown-recovery acceptance has passed through the injected NF seam. Durable persistence remains future work.
 
 ## Runtime choice
 
@@ -58,6 +58,25 @@ npm run test:cloudflare
 
 The test creates a unique key, writes it, forces an `UNKNOWN` result, resolves it by Cloudflare readback without re-executing the write, verifies duplicate dispatch, accepts the same-action handoff checkpoint, deletes the key in a `finally` block, and verifies remote readback is absent afterward. This is provider-side-effect preflight evidence, not real NF A-B-C T7 evidence. A skipped test is not current provider evidence; the live run must succeed and the namespace readback must confirm cleanup.
 
+## Needs Forever NF acceptance
+
+`NeedsForeverLocalFileRuntime` is the DPC-side adapter for the locally installed `needs-forever` control path. It launches a real disposable independent-worker task through an injected absolute `control.mjs` path, confines the action to a per-task temporary workspace, returns `UNKNOWN` when observation times out, and proves the external file effect through `readback` without starting a second NF task. Cleanup pauses the disposable NF task and removes only the adapter-owned workspace. The NF repository is not modified.
+
+The opt-in acceptance test requires:
+
+- `DPC_NF_LIVE=1`
+- `DPC_NF_CONTROL_PATH` pointing to the locally installed Needs Forever `scripts/control.mjs`
+
+Run from PowerShell:
+
+```powershell
+$env:DPC_NF_LIVE="1"
+$env:DPC_NF_CONTROL_PATH="D:\\WILL\\TOOLS\\needs-forever\\plugins\\needs-forever\\scripts\\control.mjs"
+npm run test:needs-forever
+```
+
+The live path starts the real NF worker/controller/judge control process, performs one disposable file side effect, forces an observation `UNKNOWN`, recovers by DPC readback without re-execution, verifies duplicate dispatch, same-action handoff, and selection of the next action. The test does not use a simulated fixture and does not persist credentials or absolute workspace paths in receipts or handoffs.
+
 ## Standard Kit and projection isolation
 
 `inspectProfileConformance` applies shared descriptor checks to every profile; profile code does not implement Core lifecycle or execution safety. `ClaimAuthority` exposes only execution-right operations. `ProjectionAdapter` can publish/read a derived view and report drift against an authoritative snapshot, but it has no plan, ledger, claim, or scheduler write operation.
@@ -80,7 +99,7 @@ An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.r
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory and real-side-effect adapters. The current local suite has 37 tests: 36 pass and the opt-in live Cloudflare test is skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, and local reparse-point confinement. Durable persistence and crash-window reconciliation remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory and real-side-effect adapters. The current local suite has 40 tests: 38 pass and the two opt-in live tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, and the real Needs Forever adapter seam. Durable persistence and crash-window reconciliation remain future work.
 
 ## Commands
 

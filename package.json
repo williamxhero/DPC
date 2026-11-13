@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test tests/**/*.test.js",
     "test:cloudflare": "npm run build && node --test tests/cloudflare-live.test.js",
+    "test:needs-forever": "npm run build && node --test tests/needs-forever-live.test.js",
     "check": "npm run build"
   },
   "devDependencies": {
