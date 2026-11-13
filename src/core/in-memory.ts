@@ -6,6 +6,7 @@ import {
   ClaimConflictError,
   type BusinessInterpretation,
   type DomainGateResult,
+  type DurableExecutionStore,
   type EventKey,
   type ExecutionIdentity,
   type ExecutionRecord,
@@ -289,5 +290,72 @@ export class InMemoryNfRuntime implements NfActionRuntime {
   public async execute(request: NfExecutionRequest): Promise<NfExecutionResult> {
     this.requests.push(request.identity);
     return typeof this.response === "function" ? this.response(request) : this.response;
+  }
+}
+
+/**
+ * Convenience adapter that combines InMemoryActionLedger and InMemoryClaimAuthority
+ * into a single DurableExecutionStore for use in tests and local development.
+ * The migrate() method is a no-op because the in-memory store requires no schema setup.
+ */
+export class InMemoryDurableStore implements DurableExecutionStore {
+  public readonly ledger: InMemoryActionLedger;
+  public readonly claims: InMemoryClaimAuthority;
+
+  public constructor(opts: { leaseDurationMs?: number; clock?: () => number } = {}) {
+    this.ledger = new InMemoryActionLedger();
+    this.claims = new InMemoryClaimAuthority(opts.leaseDurationMs, opts.clock);
+  }
+
+  public async migrate(): Promise<void> {
+    // In-memory store requires no schema setup.
+  }
+
+  public beginExecution(
+    identity: ExecutionIdentity,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
+    return this.ledger.beginExecution(identity, action);
+  }
+
+  public appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void> {
+    return this.ledger.appendReceiptWithClaim(receipt, claims, now);
+  }
+
+  public replaceReceiptWithClaim(
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    claims: ClaimAuthority,
+    now: number,
+  ): Promise<void> {
+    return this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, claims, now);
+  }
+
+  public findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined> {
+    return this.ledger.findByEventKey(programId, planId, eventKey);
+  }
+
+  public findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined> {
+    return this.ledger.findLatestForAction(programId, planId, actionId);
+  }
+
+  public hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean> {
+    return this.ledger.hasBusinessCompletion(programId, planId, actionId);
+  }
+
+  public claim(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionIdentity> {
+    return this.claims.claim(identity, ownerId, now);
+  }
+
+  public assertValid(identity: ExecutionIdentity, now: number): Promise<void> {
+    return this.claims.assertValid(identity, now);
+  }
+
+  public withValidClaim<T>(identity: ExecutionIdentity, operation: () => Promise<T>): Promise<T> {
+    return this.claims.withValidClaim(identity, operation);
+  }
+
+  public release(identity: ExecutionIdentity): Promise<void> {
+    return this.claims.release(identity);
   }
 }

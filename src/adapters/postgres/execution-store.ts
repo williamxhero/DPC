@@ -9,6 +9,7 @@ import type {
   ActionId,
   ActionLedger,
   ClaimAuthority,
+  DurableExecutionStore,
   ExecutionIdentity,
   ExecutionRecord,
   EventKey,
@@ -51,7 +52,7 @@ type ExecutionRow = {
  * ClaimAuthority deliberately so atomic claim/receipt transitions stay inside
  * one database transaction instead of crossing two independent adapters.
  */
-export class PostgresExecutionStore implements ActionLedger, ClaimAuthority, ReconciliationStore {
+export class PostgresExecutionStore implements DurableExecutionStore, ReconciliationStore {
   private readonly pool: PgPool;
   private readonly ownsPool: boolean;
   private readonly clock: () => number;
