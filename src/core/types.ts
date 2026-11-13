@@ -256,6 +256,53 @@ export type RecoveryResult =
       readonly receipt?: Receipt;
     };
 
+/**
+ * Combined durable execution store that hides action execution rows, append-only
+ * receipts, claims, fences, leases, transaction boundaries, outbox insertion and
+ * reconciliation queries behind a single seam.
+ *
+ * ## Transaction semantics
+ * `beginExecution` is idempotent: a repeated call with the same (program_id,
+ * plan_id, event_key) returns the existing record without creating a second row.
+ *
+ * `appendReceiptWithClaim` and `replaceReceiptWithClaim` MUST validate the claim
+ * and persist the receipt in one atomic compare-and-write (CAS) operation.
+ * Adapters that share a database connection (e.g. PostgresExecutionStore) achieve
+ * this inside a single SQL transaction; in-memory adapters perform both steps
+ * without an intervening await.
+ *
+ * ## Ordering
+ * Receipts are append-only within an execution lifecycle. `appendReceiptWithClaim`
+ * rejects a write if a receipt already exists (`StaleWriteError`).
+ * `replaceReceiptWithClaim` rejects if there is no prior UNKNOWN receipt.
+ *
+ * ## Error semantics
+ * - `ClaimConflictError`: a valid unexpired claim already exists for a different
+ *   owner; the caller must back off and retry after the lease expires.
+ * - `StaleWriteError`: the claim fence, event key or run generation on the
+ *   provided identity no longer matches the stored claim, or the execution row is
+ *   not in the expected state.
+ * - `DpcAdapterError`: a lower-level storage failure that the caller cannot
+ *   recover from without human intervention.
+ *
+ * ## Performance
+ * Implementations are expected to be network-bound. Callers must not hold any
+ * application-level lock while awaiting these methods. The store itself is
+ * responsible for serialising concurrent writers via its own row-level locking or
+ * CAS mechanism.
+ *
+ * ## migrate()
+ * Must be safe to call more than once (versioned, repeat-safe). Calling it on an
+ * already-migrated schema MUST succeed without modifying existing data.
+ */
+export interface DurableExecutionStore extends ActionLedger, ClaimAuthority {
+  /**
+   * Apply (or verify) the versioned schema migration.
+   * Safe to call on every startup — idempotent, never destructive.
+   */
+  migrate(): Promise<void>;
+}
+
 export class DpcAdapterError extends Error {
   public readonly code = "ADAPTER_ERROR" as const;
 

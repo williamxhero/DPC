@@ -48,6 +48,7 @@ export type { DpcCoreDependencies } from "./core/kernel.js";
 export {
   InMemoryActionLedger,
   InMemoryClaimAuthority,
+  InMemoryDurableStore,
   InMemoryNfRuntime,
   InMemoryPlanSource,
   InMemoryProfile,
