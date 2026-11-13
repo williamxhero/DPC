@@ -20,6 +20,7 @@ import {
   type Profile,
   type ProgramId,
   type Receipt,
+  type ReconciliationCandidate,
   StaleWriteError,
 } from "./types.js";
 
@@ -357,5 +358,65 @@ export class InMemoryDurableStore implements DurableExecutionStore {
 
   public release(identity: ExecutionIdentity): Promise<void> {
     return this.claims.release(identity);
+  }
+
+  public async listReconciliationCandidates(now: number): Promise<readonly ReconciliationCandidate[]> {
+    const candidates: ReconciliationCandidate[] = [];
+    const records = this.ledger.records();
+
+    for (const record of records) {
+      // UNKNOWN receipts
+      if (record.receipt && record.receipt.businessStatus === "UNKNOWN") {
+        candidates.push({
+          executionId: this.eventKey(record.identity),
+          programId: record.identity.programId,
+          planId: record.identity.planId,
+          planRevision: record.identity.planRevision,
+          actionId: record.identity.actionId,
+          eventKey: record.identity.eventKey,
+          kind: "UNKNOWN_RECEIPT",
+          observedAt: record.receipt.recordedAt,
+        });
+      }
+
+      // STARTED without receipt
+      if (record.lifecycle === "STARTED" && !record.receipt) {
+        candidates.push({
+          executionId: this.eventKey(record.identity),
+          programId: record.identity.programId,
+          planId: record.identity.planId,
+          planRevision: record.identity.planRevision,
+          actionId: record.identity.actionId,
+          eventKey: record.identity.eventKey,
+          kind: "STARTED_WITHOUT_RECEIPT",
+          observedAt: now,
+        });
+      }
+
+      // Expired claims
+      const claim = this.claims["claims"].get(this.claimKey(record.identity));
+      if (claim && claim.expiresAt <= now) {
+        candidates.push({
+          executionId: this.eventKey(record.identity),
+          programId: record.identity.programId,
+          planId: record.identity.planId,
+          planRevision: record.identity.planRevision,
+          actionId: record.identity.actionId,
+          eventKey: record.identity.eventKey,
+          kind: "EXPIRED_CLAIM",
+          observedAt: now,
+        });
+      }
+    }
+
+    return candidates;
+  }
+
+  private eventKey(identity: ExecutionIdentity): string {
+    return `${identity.programId}:${identity.planId}:${identity.eventKey}`;
+  }
+
+  private claimKey(identity: ExecutionIdentity): string {
+    return `${identity.programId}:${identity.planId}:${identity.actionId}`;
   }
 }

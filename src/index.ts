@@ -15,7 +15,6 @@ export type { PostgresHandoffStoreConfig } from "./adapters/postgres/handoff-sto
 export { LocalFileEffectRuntime } from "./adapters/local-file.js";
 export { InMemoryWakeStore, WakeCoordinator } from "./core/wake.js";
 export { ReconciliationRunner } from "./core/reconciliation.js";
-export type { ReconciliationCandidate, ReconciliationKind, ReconciliationStore } from "./core/reconciliation.js";
 export { HandoffBlockedError, HandoffCoordinator, InMemoryHandoffStore } from "./core/handoff.js";
 export { inspectProfileConformance } from "./core/standard-kit.js";
 export { InMemoryProjectionAdapter } from "./core/projection.js";

@@ -256,6 +256,19 @@ export type RecoveryResult =
       readonly receipt?: Receipt;
     };
 
+export type ReconciliationKind = "UNKNOWN_RECEIPT" | "STARTED_WITHOUT_RECEIPT" | "EXPIRED_CLAIM";
+
+export interface ReconciliationCandidate {
+  readonly executionId: string;
+  readonly programId: ProgramId;
+  readonly planId: PlanId;
+  readonly planRevision: PlanRevision;
+  readonly actionId: ActionId;
+  readonly eventKey: EventKey;
+  readonly kind: ReconciliationKind;
+  readonly observedAt: number;
+}
+
 /**
  * Combined durable execution store that hides action execution rows, append-only
  * receipts, claims, fences, leases, transaction boundaries, outbox insertion and
@@ -301,6 +314,13 @@ export interface DurableExecutionStore extends ActionLedger, ClaimAuthority {
    * Safe to call on every startup — idempotent, never destructive.
    */
   migrate(): Promise<void>;
+
+  /**
+   * List reconciliation candidates: UNKNOWN receipts, STARTED executions without
+   * receipts, and expired claims. This is a read-only discovery operation that
+   * never invokes an external action.
+   */
+  listReconciliationCandidates(now: number): Promise<readonly ReconciliationCandidate[]>;
 }
 
 export class DpcAdapterError extends Error {

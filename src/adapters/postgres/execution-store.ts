@@ -3,7 +3,6 @@ import pg from "pg";
 import type { Pool as PgPool, PoolClient, PoolConfig } from "pg";
 
 const { Pool } = pg;
-import type { ReconciliationCandidate, ReconciliationStore } from "../../core/reconciliation.js";
 import type {
   ActionDescriptor,
   ActionId,
@@ -16,6 +15,7 @@ import type {
   PlanId,
   ProgramId,
   Receipt,
+  ReconciliationCandidate,
 } from "../../core/types.js";
 import {
   ClaimConflictError,
@@ -52,7 +52,7 @@ type ExecutionRow = {
  * ClaimAuthority deliberately so atomic claim/receipt transitions stay inside
  * one database transaction instead of crossing two independent adapters.
  */
-export class PostgresExecutionStore implements DurableExecutionStore, ReconciliationStore {
+export class PostgresExecutionStore implements DurableExecutionStore {
   private readonly pool: PgPool;
   private readonly ownsPool: boolean;
   private readonly clock: () => number;
