@@ -22,9 +22,14 @@ export interface PostgresInboxStoreConfig {
  * putOrIgnore uses INSERT … ON CONFLICT DO NOTHING so that concurrent
  * deliveries of the same external event ID produce exactly one row.
  *
- * markProcessed uses a conditional UPDATE that rejects an already-processed
- * row or a missing row with StaleWriteError, making it safe to call inside the
- * same transaction that records the corresponding execution receipt.
+ * markProcessed issues a single conditional UPDATE with no independent
+ * transaction. This makes it composable: pass a PoolClient that is already
+ * inside a transaction to include the inbox status change atomically in the
+ * same execution transaction as the corresponding business receipt.
+ * When no client is provided, the update runs directly on the pool (safe as a
+ * single-statement CAS — no separate BEGIN/COMMIT needed).
+ *
+ * Throws StaleWriteError if the row is missing or already PROCESSED.
  */
 export class PostgresInboxStore implements InboxStore {
   private readonly pool: Pool;
@@ -73,41 +78,35 @@ export class PostgresInboxStore implements InboxStore {
     return result.rows[0] ? this.map(result.rows[0]) : undefined;
   }
 
+  /**
+   * Mark the occurrence as PROCESSED using a single conditional UPDATE.
+   *
+   * Pass a PoolClient that is already inside an open transaction to make this
+   * operation part of the same atomic write as the corresponding execution
+   * receipt. If no client is provided, the statement runs directly on the
+   * pool (a single statement is implicitly atomic — no independent BEGIN is
+   * needed or opened here).
+   *
+   * Throws StaleWriteError if no RECEIVED row exists for the given key.
+   */
   public async markProcessed(
     provider: string,
     externalEventId: string,
     processedAt: number,
+    client?: Pick<PoolClient, "query">,
   ): Promise<InboxOccurrence> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      const result = await client.query<InboxRow>(
-        `UPDATE dpc_inbox_events
-         SET status = 'PROCESSED', processed_at = $3
-         WHERE provider = $1 AND external_event_id = $2 AND status = 'RECEIVED'
-         RETURNING provider, external_event_id, event_type, payload_json, status, received_at, processed_at`,
-        [provider, externalEventId, new Date(processedAt)],
-      );
-      if (!result.rows[0]) {
-        await client.query("ROLLBACK");
-        // Determine why: does the row exist?
-        const check = await this.pool.query<{ status: string }>(
-          "SELECT status FROM dpc_inbox_events WHERE provider = $1 AND external_event_id = $2",
-          [provider, externalEventId],
-        );
-        if (!check.rows[0]) {
-          throw new StaleWriteError(`Inbox occurrence not found: ${provider}:${externalEventId}`);
-        }
-        throw new StaleWriteError(`Inbox occurrence already processed: ${provider}:${externalEventId}`);
-      }
-      await client.query("COMMIT");
-      return this.map(result.rows[0]);
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw error;
-    } finally {
-      client.release();
+    const queryable = client ?? this.pool;
+    const result = await queryable.query<InboxRow>(
+      `UPDATE dpc_inbox_events
+       SET status = 'PROCESSED', processed_at = $3
+       WHERE provider = $1 AND external_event_id = $2 AND status = 'RECEIVED'
+       RETURNING provider, external_event_id, event_type, payload_json, status, received_at, processed_at`,
+      [provider, externalEventId, new Date(processedAt)],
+    );
+    if (!result.rows[0]) {
+      throw new StaleWriteError(`Inbox occurrence not found or already processed: ${provider}:${externalEventId}`);
     }
+    return this.map(result.rows[0]);
   }
 
   private map(row: InboxRow): InboxOccurrence {
