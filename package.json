@@ -1,0 +1,17 @@
+{
+  "name": "dpc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable Plan Continuation core",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/**/*.test.js",
+    "test:cloudflare": "npm run build && node --test tests/cloudflare-live.test.js",
+    "check": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^5.7.2"
+  }
+}

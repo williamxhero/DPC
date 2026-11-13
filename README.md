@@ -1,0 +1,90 @@
+# DPC
+
+Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. The repository currently implements the first in-memory vertical slice plus T2 claim/recovery, T4 wake coordination, T5 handoff, and T6 Standard Kit/projection rules; durable persistence and a real external action are later tickets.
+
+## Runtime choice
+
+T1 uses TypeScript compiled to Node.js ESM. The repository was greenfield, so this choice provides a small runtime with explicit contracts for the adapter seams and strict compile-time checking without adding a production dependency. Tests use Node's built-in test runner; only the TypeScript compiler is a development dependency.
+
+## Public module interface
+
+`DpcCore.dispatch(request)` is the external seam. One call advances at most one action occurrence:
+
+1. Read the current `PlanSnapshot` from the injected `PlanSource`.
+2. Ask the injected `Profile` for descriptors and evaluate deterministic eligibility in descriptor order.
+3. Derive stable execution identity from the caller's `eventKey` and selected action.
+4. Record a started execution through the injected `ActionLedger` before invoking the injected `NfActionRuntime`.
+5. Interpret the NF result through the profile, write one `Receipt`, then read the plan again.
+6. Select and return the next eligible action from the current revision; it is not executed in the same call.
+
+The Core never constructs a production adapter and never exposes storage layout, lifecycle mutation, or profile-specific state to callers.
+
+## Contract and ordering
+
+- `eventKey` is the caller's stable trigger identity. Repeating it is idempotent in the in-memory ledger.
+- `nfTaskId` is derived as `nf:<eventKey>:<actionId>`. `runGeneration` starts at `1` for the first occurrence; the injected `ClaimAuthority` replaces the provisional fence with a monotonically increasing claim fence. T1-only tests may explicitly use `NoopClaimAuthority`; the Core never creates a production adapter.
+- Action selection is deterministic: profile descriptor order, then time window, dependencies, and the domain gate.
+- An action is eligible only when its time window is open, all dependencies have a business `COMPLETED` receipt, and the profile gate accepts it.
+- T1 records `NF DONE` separately from business `COMPLETED`. A profile can return `CONTINUE`, `WAIT_EXTERNAL`, `FAILED`, or `UNKNOWN` even after NF runtime completion.
+- Receipt writeback happens before the second plan read. A plan revision observed after the action is the only context used to choose the returned `nextAction`.
+- T1 handles one action occurrence per dispatch. It does not drain a plan or automatically retry an uncertain external submission.
+
+## Error behavior
+
+- `DpcAdapterError` wraps plan, NF, profile, and ledger adapter failures. A failed NF call is recorded as a failed receipt before the error is surfaced.
+- `ClaimConflictError` reports an active owner; `StaleWriteError` rejects old fence/generation/revision/task/event identities. Claims are required dependencies of the Core, so ownership cannot be silently disabled.
+- `InvalidPlanError` is raised for duplicate action IDs or dependencies that reference no descriptor.
+- A valid plan with no eligible action returns `NO_ELIGIBLE_ACTION`; this is normal control flow, not an exception.
+- A repeated `eventKey` returns `DUPLICATE` and does not invoke NF again.
+
+## Local real-side-effect adapter
+
+`LocalFileEffectRuntime` is the safe pre-T7 adapter. It writes only below a caller-provided temporary root, rejects path traversal, records an idempotency marker per `nfTaskId`, supports readback, and exposes cleanup. The integration tests use a real temporary file: the Core records a real write, duplicate dispatch does not invoke it twice, and an ambiguous submission is resolved by readback without re-execution. This validates the seam locally but does not replace the required authorized remote/provider acceptance.
+
+## Cloudflare KV acceptance adapter
+
+`CloudflareKvEffectRuntime` is available for API-token integrations, and `WranglerKvEffectRuntime` is used for the local authenticated CLI acceptance path. The Wrangler adapter writes one disposable identity envelope to a dedicated KV namespace, refuses conflicting identities, supports readback and cleanup, and never stores OAuth/API credentials in a receipt or handoff.
+
+The live test is opt-in and requires local Wrangler authentication (`wrangler whoami` succeeds), plus:
+
+- `DPC_CLOUDFLARE_LIVE=1`
+- `CLOUDFLARE_KV_NAMESPACE_ID`
+
+Run only against a disposable namespace:
+
+```bash
+npm run test:cloudflare
+```
+
+The test creates a unique key, writes it, forces an `UNKNOWN` result, resolves it by Cloudflare readback without re-executing the write, verifies duplicate dispatch, transfers the same action through a handoff checkpoint, and deletes the key in a `finally` block. A skipped test is not T7 evidence; the live run must succeed and the namespace readback must confirm cleanup.
+
+## Standard Kit and projection isolation
+
+`inspectProfileConformance` applies shared descriptor checks to every profile; profile code does not implement Core lifecycle or execution safety. `ClaimAuthority` exposes only execution-right operations. `ProjectionAdapter` can publish/read a derived view and report drift against an authoritative snapshot, but it has no plan, ledger, claim, or scheduler write operation.
+
+## Wake intent and pull-first coordination
+
+`WakeCoordinator` normalizes manual, timer, evidence, revision, handoff, and recovery triggers into one `WakeIntent` identity. `dedupeKey` is immutable; the same key returns `DUPLICATE` instead of creating another schedule. `resolve`, `claim`, `acknowledgeDelivery`, and `writeResult` are the pull-first seam. A stale wake fence is rejected, and an unknown delivery remains `UNKNOWN` until a later claim resolves it. Push/native launch is not required and no second scheduler is created.
+
+## Plan revision and tactical exploration
+
+`PlanRevisionRecord` carries source, evidence references, approval reference, scope, effective time, and lineage. `revisionCanAffectAction` returns true only for a scoped, not-started, unfrozen action with no external effect after the revision becomes effective. Started/frozen/effected actions retain their original execution identity and evidence.
+
+`createAdvisoryPlanChange` creates an `ADVISORY` proposal only; it has no plan writer and cannot change authorization, scheduler, cadence, or action eligibility. `TacticalRoute` records expected evidence/signals, risks, fallback, success conditions, and stop conditions. `assessTacticalRoute` marks a repeated route as `NO_PROGRESS`.
+
+## Claim and recovery rules
+
+T2 adds an injected `ClaimAuthority` seam. A production implementation will own leases and fencing; `InMemoryClaimAuthority` provides the same observable contract for tests. A successful claim replaces the provisional fence with a monotonically increasing fence. Receipt writeback first validates the current fence, and a runtime result may echo its full identity; an old generation, revision, task, or fence is rejected as `StaleWriteError` rather than accepted as success.
+
+An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.recover(eventKey)` calls only the injected `RecoveryAdapter.readback` seam and never calls `NfActionRuntime.execute`. An absent readback remains `STILL_UNKNOWN`; a confirmed readback replaces the unknown receipt under a fresh fence. This keeps recovery separate from potentially duplicate side-effecting execution.
+
+## Test surface
+
+Tests exercise the public `DpcCore.dispatch` and `recover` seams with in-memory adapters. They cover normal sequential selection, dependency and time gates, post-action plan revision readback, duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, and recovery-only unknown handling. Durable persistence and crash-window reconciliation remain future work.
+
+## Commands
+
+```bash
+npm install
+npm test
+```
