@@ -124,6 +124,9 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!execution || execution.receipt) {
         throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
       }
+      if (!this.sameStableIdentity(execution.identity, receipt.identity)) {
+        throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
+      }
       await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
       await this.updateExecution(client, execution.execution_id, receipt);
       await this.insertOutbox(client, `receipt:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECEIPT_RECORDED", execution.execution_id, receipt);

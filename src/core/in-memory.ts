@@ -239,6 +239,21 @@ export class InMemoryClaimAuthority implements ClaimAuthority {
     }
   }
 
+  /**
+   * Returns all claim entries whose lease has expired at or before `now`.
+   * Used by InMemoryDurableStore.listReconciliationCandidates without
+   * accessing the private claims map directly.
+   */
+  public listExpiredClaims(now: number): ReadonlyArray<{ readonly identity: ExecutionIdentity }> {
+    const result: Array<{ readonly identity: ExecutionIdentity }> = [];
+    for (const entry of this.claims.values()) {
+      if (entry.expiresAt <= now) {
+        result.push({ identity: entry.identity });
+      }
+    }
+    return result;
+  }
+
   private claimKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
   }
@@ -393,20 +408,20 @@ export class InMemoryDurableStore implements DurableExecutionStore {
         });
       }
 
-      // Expired claims
-      const claim = this.claims["claims"].get(this.claimKey(record.identity));
-      if (claim && claim.expiresAt <= now) {
-        candidates.push({
-          executionId: this.eventKey(record.identity),
-          programId: record.identity.programId,
-          planId: record.identity.planId,
-          planRevision: record.identity.planRevision,
-          actionId: record.identity.actionId,
-          eventKey: record.identity.eventKey,
-          kind: "EXPIRED_CLAIM",
-          observedAt: now,
-        });
-      }
+    }
+
+    // Expired claims — use the public seam, not the private map
+    for (const { identity } of this.claims.listExpiredClaims(now)) {
+      candidates.push({
+        executionId: this.eventKey(identity),
+        programId: identity.programId,
+        planId: identity.planId,
+        planRevision: identity.planRevision,
+        actionId: identity.actionId,
+        eventKey: identity.eventKey,
+        kind: "EXPIRED_CLAIM",
+        observedAt: now,
+      });
     }
 
     return candidates;
@@ -414,9 +429,5 @@ export class InMemoryDurableStore implements DurableExecutionStore {
 
   private eventKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.eventKey}`;
-  }
-
-  private claimKey(identity: ExecutionIdentity): string {
-    return `${identity.programId}:${identity.planId}:${identity.actionId}`;
   }
 }
