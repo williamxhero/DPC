@@ -183,6 +183,24 @@ export class PostgresExecutionStore implements DurableExecutionStore {
   public async claim(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionIdentity> {
     return this.transaction(async (client) => {
       const key = [identity.programId, identity.planId, identity.actionId];
+
+      // Keep the fence high-water mark separately from the active lease row.
+      // Releasing a claim removes that row, but must not reset the next fence.
+      await client.query(
+        `INSERT INTO dpc_claim_fences (program_id, plan_id, action_id, claim_fence)
+         SELECT $1, $2, $3, COALESCE(MAX(claim_fence), 0)
+         FROM dpc_claims
+         WHERE program_id = $1 AND plan_id = $2 AND action_id = $3
+         ON CONFLICT (program_id, plan_id, action_id) DO NOTHING`,
+        key,
+      );
+      const fenceRow = await client.query<{ claim_fence: number }>(
+        `SELECT claim_fence
+         FROM dpc_claim_fences
+         WHERE program_id = $1 AND plan_id = $2 AND action_id = $3
+         FOR UPDATE`,
+        key,
+      );
       const current = await client.query<{
         claim_fence: number;
         lease_until: Date;
@@ -198,7 +216,13 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (currentRow && currentRow.lease_until.getTime() > now) {
         throw new ClaimConflictError(`Action ${identity.actionId} is claimed by ${currentRow.owner_id}`);
       }
-      const fence = (currentRow?.claim_fence ?? 0) + 1;
+      const fence = (fenceRow.rows[0]?.claim_fence ?? currentRow?.claim_fence ?? 0) + 1;
+      await client.query(
+        `UPDATE dpc_claim_fences
+         SET claim_fence = $4
+         WHERE program_id = $1 AND plan_id = $2 AND action_id = $3`,
+        [...key, fence],
+      );
       await client.query(
         `INSERT INTO dpc_claims
           (program_id, plan_id, action_id, owner_id, claim_fence, event_key, run_generation, lease_until)
@@ -430,7 +454,7 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       },
       action: row.action_json,
       lifecycle: row.lifecycle,
-      receipt: row.receipt_json,
+      receipt: row.receipt_json ?? undefined,
     };
   }
 

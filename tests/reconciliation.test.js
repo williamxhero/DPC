@@ -44,7 +44,7 @@ function makeStore(impl) {
   }
   if (impl === "postgres") {
     const pool = new Pool({ connectionString });
-    const store = new PostgresExecutionStore({ pool });
+    const store = new PostgresExecutionStore({ pool, leaseDurationMs: 1000 });
     return {
       store,
       cleanup: async () => { await pool.end(); },

@@ -32,6 +32,17 @@ const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
 const id = (v) => v;
 
+// Wake stores share the durable schema with the execution store. Migrate before
+// registering the contract tests so the shared pool is ready deterministically.
+if (connectionString) {
+  const migrationPool = new Pool({ connectionString });
+  try {
+    await new PostgresExecutionStore({ pool: migrationPool }).migrate();
+  } finally {
+    await migrationPool.end();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Trigger types under T4
 // ---------------------------------------------------------------------------
@@ -234,13 +245,13 @@ function runWakeContractSuite(label, getAdapter) {
       const req = wakeRequest({ notBefore: 1000 });
       const { intent } = (await coordinator.schedule(req));
 
-      assert.equal((await coordinator.resolve(1000)).length, 1);
+      assert.equal((await coordinator.resolve(1000)).some((ready) => ready.wakeId === intent.wakeId), true);
 
       const claim = await coordinator.claim(intent.wakeId, "owner-a", 1000);
       await coordinator.acknowledgeDelivery(claim, { status: "ACKNOWLEDGED", deliveryId: "d-1" });
       await coordinator.writeResult(claim, { status: "COMPLETED", evidenceReferences: [] });
 
-      assert.equal((await coordinator.resolve(1000)).length, 0);
+      assert.equal((await coordinator.resolve(1000)).some((ready) => ready.wakeId === intent.wakeId), false);
     } finally {
       await cleanup();
     }

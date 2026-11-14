@@ -29,6 +29,7 @@ import {
   HandoffCoordinator,
   InMemoryHandoffStore,
   InMemoryInboxStore,
+  PostgresExecutionStore,
   PostgresHandoffStore,
   PostgresInboxStore,
   StaleWriteError,
@@ -37,6 +38,18 @@ import {
 const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
 const id = (v) => v;
+
+// Handoff and inbox stores share the durable schema with the execution store.
+// Migrate before registering the contract tests so their independent pools never
+// race the schema creation performed by another test file.
+if (connectionString) {
+  const migrationPool = new Pool({ connectionString });
+  try {
+    await new PostgresExecutionStore({ pool: migrationPool }).migrate();
+  } finally {
+    await migrationPool.end();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

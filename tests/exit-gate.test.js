@@ -73,10 +73,8 @@
  *
  * PostgreSQL suites (store-contract, wake, handoff-inbox, reconciliation) are gated on
  * the DPC_POSTGRES_URL environment variable. When this variable is unset, the PostgreSQL
- * sub-suites are skipped with an explicit "skip" message rather than a false pass.
- * Infrastructure blocker: DPC_POSTGRES_URL is not set in this environment; PostgreSQL
- * integration tests cannot run. This is an expected limitation of the CI environment for
- * this implementation ticket.
+ * sub-suites are skipped with an explicit "skip" message rather than a false pass. A
+ * disposable PostgreSQL database is required to collect the durable adapter evidence.
  */
 
 import assert from "node:assert/strict";

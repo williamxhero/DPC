@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS dpc_claims (
   PRIMARY KEY (program_id, plan_id, action_id)
 );
 
+CREATE TABLE IF NOT EXISTS dpc_claim_fences (
+  program_id TEXT NOT NULL,
+  plan_id TEXT NOT NULL,
+  action_id TEXT NOT NULL,
+  claim_fence INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (program_id, plan_id, action_id)
+);
+
 CREATE TABLE IF NOT EXISTS dpc_outbox_events (
   outbox_id TEXT PRIMARY KEY,
   dedupe_key TEXT NOT NULL UNIQUE,

@@ -1,6 +1,6 @@
 # DPC
 
-Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. T1–T6 are implemented and verified, the T7 Cloudflare provider-side-effect preflight has passed, and the real Needs Forever unknown-recovery acceptance has passed through the injected NF seam. Durable persistence remains future work.
+Durable Plan Continuation (DPC) is the plan-execution kernel described by SPEC #1. T1–T6 are implemented, the T7 Cloudflare provider-side-effect preflight has passed, and the real Needs Forever unknown-recovery acceptance has passed through the injected NF seam. Durable persistence is implemented behind the PostgreSQL adapter; full PostgreSQL integration evidence is opt-in and requires a disposable database.
 
 ## Runtime choice
 
@@ -114,7 +114,7 @@ An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.r
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current local suite has 42 tests: 38 pass and four opt-in live/integration tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current local suite has 111 tests: 102 pass and nine opt-in PostgreSQL/live tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
 
 ## Commands
 
