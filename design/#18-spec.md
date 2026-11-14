@@ -110,4 +110,4 @@ Core、legacy adapter、InMemory execution/claim modules、PostgreSQL adapter �
 - PostgreSQL-backed `npm test`: passed — 172 tests, 170 passed, 2 skipped, 0 failed.
 - `npm run test:postgres`: passed — 2 tests, 2 passed, 0 skipped, 0 failed.
 - `git diff --check`: passed.
-- Final commit SHA: to be filled after commit.
+- Implementation commit SHA: `6266ded06360937158e75662b85c693d109107ca`.
