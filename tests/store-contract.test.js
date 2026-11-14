@@ -206,15 +206,16 @@ function runContractSuite(label, getStore) {
 
       const now = Date.now();
       const attempts = await Promise.allSettled([
-        store.claim(identity, "owner-a", now),
-        store.claim(identity, "owner-b", now),
+        store.acquire(identity, "owner-a", now),
+        store.acquire(identity, "owner-b", now),
       ]);
       const successes = attempts.filter((attempt) => attempt.status === "fulfilled");
       const failures = attempts.filter((attempt) => attempt.status === "rejected");
       assert.equal(successes.length, 1, "exactly one concurrent claimer must win");
       assert.equal(failures.length, 1, "exactly one concurrent claimer must lose");
-      assert.ok(successes[0].value.claimFence > 0, "winning fence must be positive");
+      assert.ok(successes[0].value.identity.claimFence > 0, "winning fence must be positive");
       assert.ok(failures[0].reason instanceof ClaimConflictError, "loser must receive ClaimConflictError");
+      await store.releaseExecution(successes[0].value);
     } finally {
       await cleanup();
     }
@@ -233,23 +234,61 @@ function runContractSuite(label, getStore) {
       const identity = { programId, planId, planRevision, actionId, eventKey, nfTaskId, runGeneration: 1, claimFence: 0 };
 
       const now = Date.now();
-      const leaseDurationMs = 1; // very short so first lease expires immediately for second claim
       const future = now + 10_000;
 
-      const first = await store.claim(identity, "owner-a", now);
-      assert.equal(first.claimFence, 1);
+      const first = await store.acquire(identity, "owner-a", now);
+      assert.equal(first.identity.claimFence, 1);
 
       // Release the first claim
-      await store.release(first);
+      await store.releaseExecution(first);
 
       // Second claim should produce fence 2
-      const second = await store.claim({ ...identity, claimFence: 0 }, "owner-b", future);
-      assert.equal(second.claimFence, 2);
+      const second = await store.acquire({ ...identity, claimFence: 0 }, "owner-b", future);
+      assert.equal(second.identity.claimFence, 2);
+      await store.releaseExecution(second);
     } finally {
       await cleanup();
     }
   });
 
+  test(`[${label}] startExecution rejects a stale lease without creating an execution`, async () => {
+    const { store, cleanup } = getStore("stale-start");
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const identity = {
+        programId: id(`contract-prog-stale-start-${ts}-${label}`),
+        planId: id("contract-plan-stale-start"),
+        planRevision: id("r1"),
+        actionId: id("action-stale-start"),
+        eventKey: id("stale-start-event"),
+        nfTaskId: id(`nf-stale-start-${ts}`),
+        runGeneration: 1,
+        claimFence: 0,
+      };
+      const descriptor = makeDescriptor(identity.actionId);
+      const staleLease = await store.acquire(identity, "owner-stale", ts);
+      await store.releaseExecution(staleLease);
+
+      await assert.rejects(
+        () => store.startExecution(staleLease, descriptor),
+        StaleWriteError,
+        "a released lease must not create an execution row",
+      );
+      assert.equal(
+        await store.findByEventKey(identity.programId, identity.planId, identity.eventKey),
+        undefined,
+        "stale start must not poison the execution identity",
+      );
+
+      const freshLease = await store.acquire(identity, "owner-fresh", ts + 1);
+      const started = await store.startExecution(freshLease, descriptor);
+      assert.equal(started.created, true);
+      await store.releaseExecution(freshLease);
+    } finally {
+      await cleanup();
+    }
+  });
   test(`[${label}] restart-readable identity — all ExecutionIdentity fields survive round-trip`, async () => {
     const { store, cleanup } = getStore("identity-roundtrip");
     try {
@@ -351,13 +390,11 @@ function runContractSuite(label, getStore) {
       const identity = { programId, planId, planRevision, actionId, eventKey, nfTaskId, runGeneration: 1, claimFence: 0 };
       const descriptor = makeDescriptor(actionId);
 
-      await store.beginExecution(identity, descriptor);
-
-      // Claim legitimately
-      const claimed = await store.claim(identity, "owner-sf", Date.now());
+      const claimed = await store.acquire(identity, "owner-sf", Date.now());
+      await store.startExecution(claimed, descriptor);
 
       // Manufacture a stale identity: wrong fence
-      const staleIdentity = { ...claimed, claimFence: claimed.claimFence + 999 };
+      const staleIdentity = { ...claimed.identity, claimFence: claimed.identity.claimFence + 999 };
       const staleReceipt = {
         identity: staleIdentity,
         actionType: `contract.${actionId}`,
@@ -369,15 +406,18 @@ function runContractSuite(label, getStore) {
 
       // The write must reject with StaleWriteError
       await assert.rejects(
-        () => store.appendReceiptWithClaim(staleReceipt, store, Date.now()),
+        () => store.appendReceipt(claimed, staleReceipt, Date.now()),
         StaleWriteError,
-        "stale fence must throw StaleWriteError",
+        "a receipt whose identity differs from the lease must throw StaleWriteError",
       );
 
-      // No partial write: record must still have no receipt
+      // No partial write: record and outbox must still have no receipt event
       const after = await store.findByEventKey(programId, planId, eventKey);
       assert.ok(after, "record must still exist");
       assert.equal(after.receipt, undefined, "no partial receipt must have been committed");
+      const outbox = (await store.pendingOutbox()).filter((event) => event.dedupeKey.includes(eventKey));
+      assert.equal(outbox.length, 0, "stale receipt must not create an outbox event");
+      await store.releaseExecution(claimed);
     } finally {
       await cleanup();
     }
@@ -496,42 +536,42 @@ function runContractSuite(label, getStore) {
       };
 
       const recordedAt = ts;
-      const firstClaim = await store.claim(provisional, "owner-rh-a", recordedAt);
-      await store.beginExecution(firstClaim, descriptor);
+      const firstClaim = await store.acquire(provisional, "owner-rh-a", recordedAt);
+      await store.startExecution(firstClaim, descriptor);
       const unknownReceipt = {
-        identity: firstClaim,
+        identity: firstClaim.identity,
         actionType: descriptor.actionType,
         nfStatus: "UNKNOWN",
         businessStatus: "UNKNOWN",
         evidence: [],
         recordedAt,
       };
-      await store.appendReceiptWithClaim(unknownReceipt, store, recordedAt);
+      await store.appendReceipt(firstClaim, unknownReceipt, recordedAt);
       const afterUnknown = await store.findByEventKey(programId, planId, eventKey);
       assert.equal(afterUnknown?.receipt?.businessStatus, "UNKNOWN");
-      await store.release(firstClaim);
+      await store.releaseExecution(firstClaim);
 
-      const recoveryClaim = await store.claim(provisional, "owner-rh-b", recordedAt + 1);
+      const recoveryClaim = await store.acquire(provisional, "owner-rh-b", recordedAt + 1);
       const recoveryReceipt = {
         ...unknownReceipt,
-        identity: recoveryClaim,
+        identity: recoveryClaim.identity,
         nfStatus: "DONE",
         businessStatus: "COMPLETED",
         recordedAt,
       };
-      await store.replaceReceiptWithClaim(firstClaim, recoveryReceipt, store, recordedAt + 1);
+      await store.replaceUnknownReceipt(recoveryClaim, firstClaim.identity, recoveryReceipt, recordedAt + 1);
 
       const current = await store.findByEventKey(programId, planId, eventKey);
       assert.equal(current?.receipt?.businessStatus, "COMPLETED");
-      assert.equal(current?.receipt?.identity.claimFence, recoveryClaim.claimFence);
+      assert.equal(current?.receipt?.identity.claimFence, recoveryClaim.identity.claimFence);
       const history = await store.listReceipts(programId, planId, eventKey);
       assert.equal(history.length, 2, "the UNKNOWN receipt must remain in append-only history");
       assert.deepEqual(
         new Set(history.map((receipt) => receipt.businessStatus)),
         new Set(["UNKNOWN", "COMPLETED"]),
       );
-      assert.ok(history.some((receipt) => receipt.identity.claimFence === firstClaim.claimFence));
-      assert.ok(history.some((receipt) => receipt.identity.claimFence === recoveryClaim.claimFence));
+      assert.ok(history.some((receipt) => receipt.identity.claimFence === firstClaim.identity.claimFence));
+      assert.ok(history.some((receipt) => receipt.identity.claimFence === recoveryClaim.identity.claimFence));
 
       const outbox = (await store.pendingOutbox()).filter((event) => event.dedupeKey.includes(eventKey));
       assert.deepEqual(
@@ -564,34 +604,34 @@ function runContractSuite(label, getStore) {
         claimFence: 0,
       };
       const descriptor = makeDescriptor(actionId);
-      const firstClaim = await store.claim(provisional, "owner-rsi-a", ts);
-      await store.beginExecution(firstClaim, descriptor);
+      const firstClaim = await store.acquire(provisional, "owner-rsi-a", ts);
+      await store.startExecution(firstClaim, descriptor);
       const unknownReceipt = {
-        identity: firstClaim,
+        identity: firstClaim.identity,
         actionType: descriptor.actionType,
         nfStatus: "UNKNOWN",
         businessStatus: "UNKNOWN",
         evidence: [],
         recordedAt: ts,
       };
-      await store.appendReceiptWithClaim(unknownReceipt, store, ts);
-      await store.release(firstClaim);
-      const recoveryClaim = await store.claim(provisional, "owner-rsi-b", ts + 1);
+      await store.appendReceipt(firstClaim, unknownReceipt, ts);
+      await store.releaseExecution(firstClaim);
+      const recoveryClaim = await store.acquire(provisional, "owner-rsi-b", ts + 1);
       const staleReceipt = {
         ...unknownReceipt,
-        identity: { ...recoveryClaim, planRevision: id("stale-revision") },
+        identity: { ...recoveryClaim.identity, planRevision: id("stale-revision") },
         nfStatus: "DONE",
         businessStatus: "COMPLETED",
       };
 
       await assert.rejects(
-        () => store.replaceReceiptWithClaim(firstClaim, staleReceipt, store, ts + 1),
+        () => store.replaceUnknownReceipt(recoveryClaim, firstClaim.identity, staleReceipt, ts + 1),
         StaleWriteError,
         "replacement receipts must preserve the full stable execution identity",
       );
       const after = await store.findByEventKey(programId, planId, eventKey);
       assert.equal(after?.receipt?.businessStatus, "UNKNOWN");
-      await store.release(recoveryClaim);
+      await store.releaseExecution(recoveryClaim);
     } finally {
       await cleanup();
     }

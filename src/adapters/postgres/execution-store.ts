@@ -10,6 +10,7 @@ import type {
   ClaimAuthority,
   DurableExecutionStore,
   ExecutionIdentity,
+  ExecutionLease,
   ExecutionRecord,
   EventKey,
   PlanId,
@@ -51,9 +52,10 @@ type ExecutionRow = {
 };
 
 /**
- * PostgreSQL durable execution adapter. It implements both ActionLedger and
- * ClaimAuthority deliberately so atomic claim/receipt transitions stay inside
- * one database transaction instead of crossing two independent adapters.
+ * PostgreSQL durable execution adapter. It implements the Core-facing
+ * ExecutionStore plus the legacy ActionLedger and ClaimAuthority interfaces
+ * deliberately so atomic claim/receipt transitions stay inside one database
+ * transaction while older non-durable callers remain compatible.
  */
 export class PostgresExecutionStore implements DurableExecutionStore {
   private readonly pool: PgPool;
@@ -91,36 +93,88 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     if (this.ownsPool) await this.pool.end();
   }
 
-  public async beginExecution(
+  public async acquire(
     identity: ExecutionIdentity,
+    ownerId: string,
+    now: number,
+  ): Promise<ExecutionLease> {
+    return { identity: await this.claim(identity, ownerId, now) };
+  }
+
+  public startExecution(
+    lease: ExecutionLease,
     action: ActionDescriptor,
   ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
     return this.transaction(async (client) => {
-      const inserted = await client.query(
-        `INSERT INTO dpc_action_executions
-          (execution_id, program_id, plan_id, plan_revision, action_id, event_key,
-           nf_task_id, run_generation, claim_fence, lifecycle, action_json)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (program_id, plan_id, event_key) DO NOTHING
-         RETURNING execution_id`,
-        [
-          this.executionId(identity),
-          identity.programId,
-          identity.planId,
-          identity.planRevision,
-          identity.actionId,
-          identity.eventKey,
-          identity.nfTaskId,
-          identity.runGeneration,
-          identity.claimFence,
-          "STARTED",
-          action,
-        ],
-      );
-      const record = await this.findExecution(client, identity.programId, identity.planId, identity.eventKey);
-      if (!record) throw new DpcAdapterError("PostgreSQL execution row disappeared after begin");
-      return { created: inserted.rowCount === 1, record };
+      await this.lockClaim(client, lease.identity, this.clock());
+      return this.beginExecutionInTransaction(client, lease.identity, action);
     });
+  }
+
+  public withValidLease<T>(lease: ExecutionLease, operation: () => Promise<T>): Promise<T> {
+    return this.withValidClaim(lease.identity, operation);
+  }
+
+  public appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
+    if (!this.sameIdentity(lease.identity, receipt.identity)) {
+      return Promise.reject(new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`));
+    }
+    return this.appendReceiptWithClaim(receipt, this, now);
+  }
+
+  public replaceUnknownReceipt(
+    lease: ExecutionLease,
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    now: number,
+  ): Promise<void> {
+    if (!this.sameStableIdentity(lease.identity, expectedIdentity)
+      || !this.sameIdentity(lease.identity, receipt.identity)) {
+      return Promise.reject(new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`));
+    }
+    return this.replaceReceiptWithClaim(expectedIdentity, receipt, this, now);
+  }
+
+  public releaseExecution(lease: ExecutionLease): Promise<void> {
+    return this.release(lease.identity);
+  }
+
+  public beginExecution(
+    identity: ExecutionIdentity,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
+    return this.transaction((client) => this.beginExecutionInTransaction(client, identity, action));
+  }
+
+  private async beginExecutionInTransaction(
+    client: Queryable,
+    identity: ExecutionIdentity,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
+    const inserted = await client.query(
+      `INSERT INTO dpc_action_executions
+        (execution_id, program_id, plan_id, plan_revision, action_id, event_key,
+         nf_task_id, run_generation, claim_fence, lifecycle, action_json)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (program_id, plan_id, event_key) DO NOTHING
+       RETURNING execution_id`,
+      [
+        this.executionId(identity),
+        identity.programId,
+        identity.planId,
+        identity.planRevision,
+        identity.actionId,
+        identity.eventKey,
+        identity.nfTaskId,
+        identity.runGeneration,
+        identity.claimFence,
+        "STARTED",
+        action,
+      ],
+    );
+    const record = await this.findExecution(client, identity.programId, identity.planId, identity.eventKey);
+    if (!record) throw new DpcAdapterError("PostgreSQL execution row disappeared after begin");
+    return { created: inserted.rowCount === 1, record };
   }
 
   public async appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void> {
@@ -547,6 +601,10 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       && left.eventKey === right.eventKey
       && left.nfTaskId === right.nfTaskId
       && left.runGeneration === right.runGeneration;
+  }
+
+  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return this.sameStableIdentity(left, right) && left.claimFence === right.claimFence;
   }
 
   private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {

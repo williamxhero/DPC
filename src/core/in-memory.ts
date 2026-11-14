@@ -9,6 +9,7 @@ import {
   type DurableExecutionStore,
   type EventKey,
   type ExecutionIdentity,
+  type ExecutionLease,
   type ExecutionRecord,
   type NfActionRuntime,
   type NfExecutionRequest,
@@ -375,6 +376,54 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     // In-memory store requires no schema setup.
   }
 
+  public async acquire(
+    identity: ExecutionIdentity,
+    ownerId: string,
+    now: number,
+  ): Promise<ExecutionLease> {
+    return { identity: await this.claims.claim(identity, ownerId, now) };
+  }
+
+  public startExecution(
+    lease: ExecutionLease,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
+    return this.claims.withValidClaim(
+      lease.identity,
+      () => this.ledger.beginExecution(lease.identity, action),
+    );
+  }
+
+  public withValidLease<T>(lease: ExecutionLease, operation: () => Promise<T>): Promise<T> {
+    return this.claims.withValidClaim(lease.identity, operation);
+  }
+
+  public async appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
+    if (!this.sameIdentity(lease.identity, receipt.identity)) {
+      throw new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`);
+    }
+    await this.ledger.appendReceiptWithClaim(receipt, this.claims, now);
+    await this.claims.release(receipt.identity);
+  }
+
+  public async replaceUnknownReceipt(
+    lease: ExecutionLease,
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    now: number,
+  ): Promise<void> {
+    if (!this.sameStableIdentity(lease.identity, expectedIdentity)
+      || !this.sameIdentity(lease.identity, receipt.identity)) {
+      throw new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`);
+    }
+    await this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, this.claims, now);
+    await this.claims.release(receipt.identity);
+  }
+
+  public releaseExecution(lease: ExecutionLease): Promise<void> {
+    return this.claims.release(lease.identity);
+  }
+
   public beginExecution(
     identity: ExecutionIdentity,
     action: ActionDescriptor,
@@ -471,6 +520,27 @@ export class InMemoryDurableStore implements DurableExecutionStore {
       kind,
       observedAt,
     };
+  }
+
+  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return left.programId === right.programId
+      && left.planId === right.planId
+      && left.planRevision === right.planRevision
+      && left.actionId === right.actionId
+      && left.eventKey === right.eventKey
+      && left.nfTaskId === right.nfTaskId
+      && left.runGeneration === right.runGeneration;
+  }
+
+  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return left.programId === right.programId
+      && left.planId === right.planId
+      && left.planRevision === right.planRevision
+      && left.actionId === right.actionId
+      && left.eventKey === right.eventKey
+      && left.nfTaskId === right.nfTaskId
+      && left.runGeneration === right.runGeneration
+      && left.claimFence === right.claimFence;
   }
 
   private eventKey(identity: ExecutionIdentity): string {

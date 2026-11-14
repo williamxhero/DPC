@@ -128,6 +128,15 @@ export interface ExecutionIdentity {
   readonly claimFence: number;
 }
 
+/**
+ * A fenced execution capability returned by an ExecutionStore.
+ * The stable identity remains the value persisted in requests and receipts;
+ * the lease only makes ownership explicit at the Core-facing seam.
+ */
+export interface ExecutionLease {
+  readonly identity: ExecutionIdentity;
+}
+
 export interface NfExecutionRequest {
   readonly identity: ExecutionIdentity;
   readonly plan: PlanSnapshot;
@@ -190,6 +199,46 @@ export interface ClaimAuthority {
   assertValid(identity: ExecutionIdentity, now: number): Promise<void>;
   withValidClaim<T>(identity: ExecutionIdentity, operation: () => Promise<T>): Promise<T>;
   release(identity: ExecutionIdentity): Promise<void>;
+}
+
+/**
+ * Core-facing execution seam. The store owns the claim authority used by its
+ * receipt writes; callers never provide a sibling ClaimAuthority instance.
+ */
+export interface ExecutionStore {
+  acquire(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionLease>;
+  startExecution(
+    lease: ExecutionLease,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }>;
+  withValidLease<T>(lease: ExecutionLease, operation: () => Promise<T>): Promise<T>;
+  appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void>;
+  replaceUnknownReceipt(
+    lease: ExecutionLease,
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    now: number,
+  ): Promise<void>;
+  releaseExecution(lease: ExecutionLease): Promise<void>;
+  findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined>;
+  findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined>;
+  hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean>;
+}
+
+export interface ReceiptHistoryReader {
+  listReceipts(
+    programId: ProgramId,
+    planId: PlanId,
+    eventKey: EventKey,
+  ): Promise<readonly Receipt[]>;
+}
+
+export interface OutboxReader {
+  pendingOutbox(): Promise<readonly OutboxEvent[]>;
+}
+
+export interface ReconciliationReader {
+  listReconciliationCandidates(now: number): Promise<readonly ReconciliationCandidate[]>;
 }
 
 export interface RecoveryAdapter {
@@ -279,24 +328,29 @@ export interface ReconciliationCandidate {
 }
 
 /**
- * Combined durable execution store that hides action execution rows, append-only
- * receipts, claims, fences, leases, transaction boundaries, outbox insertion and
- * reconciliation queries behind a single seam.
+ * Combined durable execution store. Core consumes the smaller ExecutionStore
+ * seam; this aggregate also exposes operational readers and legacy ledger/claim
+ * methods so existing adapters and tests can migrate without a flag day.
+ *
+ * The implementation hides action execution rows, append-only receipts, claims,
+ * fences, leases, transaction boundaries, outbox insertion and reconciliation
+ * queries behind one durable Adapter.
  *
  * ## Transaction semantics
- * `beginExecution` is idempotent: a repeated call with the same (program_id,
- * plan_id, event_key) returns the existing record without creating a second row.
+ * `startExecution` is idempotent for the scoped execution identity. The
+ * Core-facing receipt methods validate their supplied lease and persist the
+ * receipt, lifecycle, outbox event and claim release atomically.
  *
- * `appendReceiptWithClaim` and `replaceReceiptWithClaim` MUST validate the claim
- * and persist the receipt in one atomic compare-and-write (CAS) operation.
- * Adapters that share a database connection (e.g. PostgresExecutionStore) achieve
- * this inside a single SQL transaction; in-memory adapters perform both steps
- * without an intervening await.
+ * The legacy `ActionLedger` methods remain available for compatibility. New
+ * Core code must use `ExecutionStore.appendReceipt` and
+ * `ExecutionStore.replaceUnknownReceipt`, which do not accept a sibling claim
+ * authority.
  *
  * ## Ordering
- * Receipts are append-only within an execution lifecycle. `appendReceiptWithClaim`
- * rejects a write if a receipt already exists (`StaleWriteError`).
- * `replaceReceiptWithClaim` rejects if there is no prior UNKNOWN receipt.
+ * Receipts are append-only within an execution lifecycle. The Core-facing
+ * `appendReceipt` rejects a write if a receipt already exists
+ * (`StaleWriteError`). `replaceUnknownReceipt` rejects if there is no prior
+ * UNKNOWN receipt.
  *
  * ## Error semantics
  * - `ClaimConflictError`: a valid unexpired claim already exists for a different
@@ -317,7 +371,7 @@ export interface ReconciliationCandidate {
  * Must be safe to call more than once (versioned, repeat-safe). Calling it on an
  * already-migrated schema MUST succeed without modifying existing data.
  */
-export interface DurableExecutionStore extends ActionLedger, ClaimAuthority {
+export interface DurableExecutionStore extends ActionLedger, ClaimAuthority, ExecutionStore, ReceiptHistoryReader, OutboxReader, ReconciliationReader {
   /**
    * Apply (or verify) the versioned schema migration.
    * Safe to call on every startup — idempotent, never destructive.

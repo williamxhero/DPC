@@ -13,16 +13,16 @@ T1 uses TypeScript compiled to Node.js ESM. The repository was greenfield, so th
 1. Read the current `PlanSnapshot` from the injected `PlanSource`.
 2. Ask the injected `Profile` for descriptors and evaluate deterministic eligibility in descriptor order.
 3. Derive stable execution identity from the caller's `eventKey` and selected action.
-4. Record a started execution through the injected `ActionLedger` before invoking the injected `NfActionRuntime`.
+4. Record a started execution through the injected `ExecutionStore` before invoking the injected `NfActionRuntime`.
 5. Interpret the NF result through the profile, write one `Receipt`, then read the plan again.
 6. Select and return the next eligible action from the current revision; it is not executed in the same call.
 
-The Core never constructs a production adapter and never exposes storage layout, lifecycle mutation, or profile-specific state to callers.
+The Core never constructs a production adapter and never exposes storage layout, lifecycle mutation, or profile-specific state to callers. The preferred durable dependency is `ExecutionStore`; the older `{ ledger, claims }` dependency form remains supported only as a compatibility path.
 
 ## Contract and ordering
 
-- `eventKey` is the caller's stable trigger identity. Repeating it is idempotent in the in-memory ledger.
-- `nfTaskId` is derived as `nf:<eventKey>:<actionId>`. `runGeneration` starts at `1` for the first occurrence; the injected `ClaimAuthority` replaces the provisional fence with a monotonically increasing claim fence. T1-only tests may explicitly use `NoopClaimAuthority`; the Core never creates a production adapter.
+- `eventKey` is the caller's stable trigger identity. Repeating it is idempotent in the durable `ExecutionStore`.
+- `nfTaskId` is derived as `nf:<eventKey>:<actionId>`. `runGeneration` starts at `1` for the first occurrence; `ExecutionStore.acquire()` replaces the provisional fence with a monotonically increasing claim fence. The legacy `{ ledger, claims }` constructor remains available through a compatibility Adapter, and T1-only tests may explicitly use `NoopClaimAuthority`; the Core never creates a production adapter.
 - Action selection is deterministic: profile descriptor order, then time window, dependencies, and the domain gate.
 - An action is eligible only when its time window is open, all dependencies have a business `COMPLETED` receipt, and the profile gate accepts it.
 - T1 records `NF DONE` separately from business `COMPLETED`. A profile can return `CONTINUE`, `WAIT_EXTERNAL`, `FAILED`, or `UNKNOWN` even after NF runtime completion.
@@ -79,7 +79,7 @@ The live path starts the real NF worker/controller/judge control process, perfor
 
 ## Durable persistence
 
-The first durable persistence slice uses PostgreSQL as the single execution store. `PostgresExecutionStore` implements the durable action ledger and claim authority together so claim/fence validation, receipt append/replace, lifecycle update, outbox insertion and claim release can share one transaction. `PostgresWakeStore` and `PostgresHandoffStore` persist the existing WakeIntent and HandoffBundle seams, while `ReconciliationRunner` exposes durable reconciliation candidates without retrying an external side effect.
+The first durable persistence slice uses PostgreSQL as the single execution store. `PostgresExecutionStore` implements the Core-facing `ExecutionStore` plus the legacy action ledger and claim authority interfaces, so claim/fence validation, receipt append/replace, lifecycle update, outbox insertion and claim release can share one transaction. `PostgresWakeStore` and `PostgresHandoffStore` persist the existing WakeIntent and HandoffBundle seams, while `ReconciliationRunner` consumes only the narrow reconciliation-reader seam and exposes durable candidates without retrying an external side effect.
 
 The schema includes executions, append-only receipts, claims, transactional outbox events, wake intents, handoff bundles, inbox dedupe and migration tracking. Event idempotency is scoped by `programId + planId + eventKey`; stale fences are rejected by conditional transaction checks. PostgreSQL remains an adapter behind the Core seam; GitHub remains plan authority.
 
@@ -108,13 +108,13 @@ The integration suite verifies durable UNKNOWN recovery, event dedupe, append-on
 
 ## Claim and recovery rules
 
-T2 adds an injected `ClaimAuthority` seam. A production implementation will own leases and fencing; `InMemoryClaimAuthority` provides the same observable contract for tests. A successful claim replaces the provisional fence with a monotonically increasing fence. Receipt writeback first validates the current fence, and a runtime result may echo its full identity; an old generation, revision, task, or fence is rejected as `StaleWriteError` rather than accepted as success.
+T2 adds an injected `ClaimAuthority` seam. The durable `ExecutionStore` now owns that authority at the Core-facing seam and returns an `ExecutionLease` carrying the fenced identity; `InMemoryClaimAuthority` provides the same observable contract for tests. A successful acquisition replaces the provisional fence with a monotonically increasing fence. Receipt writeback first validates the current lease, and a runtime result may echo its full identity; an old generation, revision, task, or fence is rejected as `StaleWriteError` rather than accepted as success.
 
 An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.recover({ programId, planId, eventKey })` calls only the injected `RecoveryAdapter.readback` seam and never calls `NfActionRuntime.execute`. An absent readback remains `STILL_UNKNOWN`; a confirmed readback replaces the unknown receipt under a fresh fence, then rereads the current plan revision before selecting a next action. Receipt append/replace uses a claim-aware compare-and-write seam so a claim expiring during the write cannot leave a committed receipt with a stale result. This keeps recovery separate from potentially duplicate side-effecting execution.
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current local suite has 111 tests: 102 pass and nine opt-in PostgreSQL/live tests are skipped unless explicitly enabled. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, claim-aware receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current default local suite has 115 tests: 106 pass and nine opt-in PostgreSQL/live tests are skipped unless explicitly enabled; with `DPC_POSTGRES_URL` set, 166 tests run with 164 pass and two live tests skipped. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, lease-oriented receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
 
 ## Commands
 

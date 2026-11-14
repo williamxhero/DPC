@@ -4,13 +4,14 @@ import {
   type ActionLedger,
   type BusinessInterpretation,
   type ClaimAuthority,
-  type DurableExecutionStore,
+  type ExecutionIdentity,
+  type ExecutionLease,
+  type ExecutionRecord,
+  type ExecutionStore,
   type DispatchRequest,
   type DispatchResult,
   DpcAdapterError,
   InvalidPlanError,
-  type ExecutionIdentity,
-  type ExecutionRecord,
   type NfActionRuntime,
   type NfExecutionResult,
   type NfTaskId,
@@ -39,7 +40,7 @@ interface DpcCoreCommonDependencies {
 export type DpcCoreDependencies = DpcCoreCommonDependencies & (
   | {
       /** Preferred durable path: one store owns claims and atomic receipt writes. */
-      readonly store: DurableExecutionStore;
+      readonly store: ExecutionStore;
       readonly ledger?: never;
       readonly claims?: never;
     }
@@ -51,25 +52,125 @@ export type DpcCoreDependencies = DpcCoreCommonDependencies & (
     }
 );
 
+class LegacyExecutionStoreAdapter implements ExecutionStore {
+  public constructor(
+    private readonly ledger: ActionLedger,
+    private readonly claims: ClaimAuthority,
+  ) {}
+
+  public async acquire(
+    identity: ExecutionIdentity,
+    ownerId: string,
+    now: number,
+  ): Promise<ExecutionLease> {
+    return { identity: await this.claims.claim(identity, ownerId, now) };
+  }
+
+  public startExecution(
+    lease: ExecutionLease,
+    action: ActionDescriptor,
+  ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
+    return this.claims.withValidClaim(
+      lease.identity,
+      () => this.ledger.beginExecution(lease.identity, action),
+    );
+  }
+
+  public withValidLease<T>(lease: ExecutionLease, operation: () => Promise<T>): Promise<T> {
+    return this.claims.withValidClaim(lease.identity, operation);
+  }
+
+  public appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
+    this.assertLeaseIdentity(lease, receipt.identity);
+    return this.ledger.appendReceiptWithClaim(receipt, this.claims, now);
+  }
+
+  public replaceUnknownReceipt(
+    lease: ExecutionLease,
+    expectedIdentity: ExecutionIdentity,
+    receipt: Receipt,
+    now: number,
+  ): Promise<void> {
+    this.assertLeaseStableIdentity(lease, expectedIdentity);
+    this.assertLeaseIdentity(lease, receipt.identity);
+    return this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, this.claims, now);
+  }
+
+  public releaseExecution(lease: ExecutionLease): Promise<void> {
+    return this.claims.release(lease.identity);
+  }
+
+  public findByEventKey(
+    programId: ExecutionIdentity["programId"],
+    planId: ExecutionIdentity["planId"],
+    eventKey: ExecutionIdentity["eventKey"],
+  ): Promise<ExecutionRecord | undefined> {
+    return this.ledger.findByEventKey(programId, planId, eventKey);
+  }
+
+  public findLatestForAction(
+    programId: ExecutionIdentity["programId"],
+    planId: ExecutionIdentity["planId"],
+    actionId: ActionId,
+  ): Promise<ExecutionRecord | undefined> {
+    return this.ledger.findLatestForAction(programId, planId, actionId);
+  }
+
+  public hasBusinessCompletion(
+    programId: ExecutionIdentity["programId"],
+    planId: ExecutionIdentity["planId"],
+    actionId: ActionId,
+  ): Promise<boolean> {
+    return this.ledger.hasBusinessCompletion(programId, planId, actionId);
+  }
+
+  private assertLeaseIdentity(lease: ExecutionLease, identity: ExecutionIdentity): void {
+    if (!this.sameIdentity(lease.identity, identity)) {
+      throw new StaleWriteError(`Execution lease is stale: ${identity.eventKey}`);
+    }
+  }
+
+  private assertLeaseStableIdentity(lease: ExecutionLease, identity: ExecutionIdentity): void {
+    if (!this.sameStableIdentity(lease.identity, identity)) {
+      throw new StaleWriteError(`Execution lease is stale: ${identity.eventKey}`);
+    }
+  }
+
+  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return left.programId === right.programId
+      && left.planId === right.planId
+      && left.planRevision === right.planRevision
+      && left.actionId === right.actionId
+      && left.eventKey === right.eventKey
+      && left.nfTaskId === right.nfTaskId
+      && left.runGeneration === right.runGeneration;
+  }
+
+  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return left.programId === right.programId
+      && left.planId === right.planId
+      && left.planRevision === right.planRevision
+      && left.actionId === right.actionId
+      && left.eventKey === right.eventKey
+      && left.nfTaskId === right.nfTaskId
+      && left.runGeneration === right.runGeneration
+      && left.claimFence === right.claimFence;
+  }
+}
+
 /**
  * The DPC module. One dispatch advances one action occurrence and returns the
  * next action without exposing storage or lifecycle internals.
  */
 export class DpcCore {
   private readonly clock: () => number;
-  private readonly ledger: ActionLedger;
-  private readonly claims: ClaimAuthority;
+  private readonly executionStore: ExecutionStore;
   private readonly ownerId: string;
 
   public constructor(private readonly dependencies: DpcCoreDependencies) {
     this.clock = dependencies.clock ?? (() => Date.now());
-    if (dependencies.store) {
-      this.ledger = dependencies.store;
-      this.claims = dependencies.store;
-    } else {
-      this.ledger = dependencies.ledger;
-      this.claims = dependencies.claims;
-    }
+    this.executionStore = dependencies.store
+      ?? new LegacyExecutionStoreAdapter(dependencies.ledger, dependencies.claims);
     this.ownerId = dependencies.ownerId ?? "dpc-core";
   }
 
@@ -78,7 +179,7 @@ export class DpcCore {
     const descriptors = this.readDescriptors(plan);
     this.validateDescriptors(descriptors);
 
-    const duplicate = await this.ledger.findByEventKey(
+    const duplicate = await this.executionStore.findByEventKey(
       request.programId,
       request.planId,
       request.eventKey,
@@ -92,7 +193,7 @@ export class DpcCore {
       return { status: "NO_ELIGIBLE_ACTION", planRevision: plan.revision };
     }
 
-    const previous = await this.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
+    const previous = await this.executionStore.findLatestForAction(plan.programId, plan.planId, action.actionId);
     const identity = this.createIdentity(
       request,
       plan,
@@ -102,7 +203,7 @@ export class DpcCore {
     const claimed = await this.claim(identity, request.now ?? this.clock());
     let started;
     try {
-      started = await this.ledger.beginExecution(claimed, action);
+      started = await this.executionStore.startExecution(claimed, action);
     } catch (error) {
       await this.release(claimed);
       throw new DpcAdapterError(`Failed to begin execution for ${action.actionId}`, error);
@@ -115,7 +216,7 @@ export class DpcCore {
     let released = false;
     try {
       const result = await this.execute(claimed, plan, action);
-      this.validateReturnedIdentity(claimed, result);
+      this.validateReturnedIdentity(claimed.identity, result);
       const receipt = await this.recordResult(claimed, plan, action, result);
       await this.release(claimed);
       released = true;
@@ -134,7 +235,7 @@ export class DpcCore {
       return {
         status: "DISPATCHED",
         planRevision: currentPlan.revision,
-        identity: claimed,
+        identity: claimed.identity,
         receipt,
         nextAction,
       };
@@ -157,7 +258,7 @@ export class DpcCore {
    * NF execute seam, so callers cannot accidentally repeat a side effect.
    */
   public async recover(request: RecoveryRequest): Promise<RecoveryResult> {
-    const record = await this.ledger.findByEventKey(
+    const record = await this.executionStore.findByEventKey(
       request.programId,
       request.planId,
       request.eventKey,
@@ -182,7 +283,7 @@ export class DpcCore {
     let released = false;
     try {
       const result = await this.dependencies.recovery.readback({
-        identity: claimed,
+        identity: claimed.identity,
         plan,
         action: record.action,
       });
@@ -196,16 +297,16 @@ export class DpcCore {
           receipt: record.receipt,
         };
       }
-      this.validateReturnedIdentity(claimed, result);
-      const receipt = await this.claims.withValidClaim(claimed, async () => {
+      this.validateReturnedIdentity(claimed.identity, result);
+      const receipt = await this.executionStore.withValidLease(claimed, async () => {
         const gate = this.checkGate(plan, record.action, result);
         const interpretation = this.interpret(plan, record.action, result, gate);
-        return this.createReceipt(claimed, record.action, result, interpretation);
+        return this.createReceipt(claimed.identity, record.action, result, interpretation);
       });
-      await this.ledger.replaceReceiptWithClaim(
+      await this.executionStore.replaceUnknownReceipt(
+        claimed,
         record.identity,
         receipt,
-        this.claims,
         this.clock(),
       );
       await this.release(claimed);
@@ -216,7 +317,7 @@ export class DpcCore {
         return {
           status: "STILL_UNKNOWN",
           planRevision: currentPlan.revision,
-          identity: claimed,
+          identity: claimed.identity,
           receipt,
         };
       }
@@ -225,7 +326,7 @@ export class DpcCore {
       return {
         status: "RECOVERED",
         planRevision: currentPlan.revision,
-        identity: claimed,
+        identity: claimed.identity,
         receipt,
         nextAction: await this.selectAction(currentPlan, descriptors, this.clock()),
       };
@@ -281,7 +382,7 @@ export class DpcCore {
     now: number,
   ): Promise<ActionDescriptor | undefined> {
     for (const action of descriptors) {
-      const record = await this.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
+      const record = await this.executionStore.findLatestForAction(plan.programId, plan.planId, action.actionId);
       if (record && this.isBlockedByRecord(record)) {
         continue;
       }
@@ -294,7 +395,7 @@ export class DpcCore {
 
       let dependenciesComplete = true;
       for (const dependency of action.dependencies) {
-        if (!(await this.ledger.hasBusinessCompletion(plan.programId, plan.planId, dependency))) {
+        if (!(await this.executionStore.hasBusinessCompletion(plan.programId, plan.planId, dependency))) {
           dependenciesComplete = false;
           break;
         }
@@ -349,35 +450,32 @@ export class DpcCore {
     };
   }
 
-  private async claim(identity: ExecutionIdentity, now: number): Promise<ExecutionIdentity> {
-    return this.claims.claim(identity, this.ownerId, now);
+  private async claim(identity: ExecutionIdentity, now: number): Promise<ExecutionLease> {
+    return this.executionStore.acquire(identity, this.ownerId, now);
   }
 
-  private async release(identity: ExecutionIdentity): Promise<void> {
-    await this.claims.release(identity);
+  private async release(lease: ExecutionLease): Promise<void> {
+    await this.executionStore.releaseExecution(lease);
   }
 
   private async execute(
-    identity: ExecutionIdentity,
+    lease: ExecutionLease,
     plan: PlanSnapshot,
     action: ActionDescriptor,
   ): Promise<NfExecutionResult> {
+    const identity = lease.identity;
     try {
       return await this.dependencies.nf.execute({ identity, plan, action });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown NF adapter error";
       const failed: NfExecutionResult = { status: "FAILED", evidence: [], error: message };
       try {
-        const failureReceipt = await this.claims.withValidClaim(identity, async () => {
+        const failureReceipt = await this.executionStore.withValidLease(lease, async () => {
           const gate = this.checkGate(plan, action, failed);
           const interpretation = this.interpret(plan, action, failed, gate);
           return this.createReceipt(identity, action, failed, interpretation);
         });
-        await this.ledger.appendReceiptWithClaim(
-          failureReceipt,
-          this.claims,
-          this.clock(),
-        );
+        await this.executionStore.appendReceipt(lease, failureReceipt, this.clock());
       } catch (recordingError) {
         throw new DpcAdapterError("NF adapter failed and failure receipt could not be recorded", recordingError);
       }
@@ -395,18 +493,18 @@ export class DpcCore {
   }
 
   private async recordResult(
-    identity: ExecutionIdentity,
+    lease: ExecutionLease,
     plan: PlanSnapshot,
     action: ActionDescriptor,
     result: NfExecutionResult,
   ): Promise<Receipt> {
-    const receipt = await this.claims.withValidClaim(identity, async () => {
+    const receipt = await this.executionStore.withValidLease(lease, async () => {
       const gate = this.checkGate(plan, action, result);
       const interpretation = this.interpret(plan, action, result, gate);
-      return this.createReceipt(identity, action, result, interpretation);
+      return this.createReceipt(lease.identity, action, result, interpretation);
     });
     try {
-      await this.ledger.appendReceiptWithClaim(receipt, this.claims, this.clock());
+      await this.executionStore.appendReceipt(lease, receipt, this.clock());
     } catch (error) {
       if (error instanceof StaleWriteError) throw error;
       throw new DpcAdapterError("Failed to write the action receipt", error);
