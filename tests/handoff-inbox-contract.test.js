@@ -29,9 +29,9 @@ import {
   HandoffCoordinator,
   InMemoryHandoffStore,
   InMemoryInboxStore,
-  PostgresExecutionStore,
   PostgresHandoffStore,
   PostgresInboxStore,
+  PostgresExecutionStore,
   StaleWriteError,
 } from "../dist/index.js";
 
@@ -515,6 +515,29 @@ if (connectionString) {
       inbox: new PostgresInboxStore({ pool }),
       cleanup: async () => { await pool.end(); },
     };
+  });
+
+  test("[PostgreSQL] inbox markProcessed participates in an outer transaction", async () => {
+    const pool = new Pool({ connectionString });
+    const inbox = new PostgresInboxStore({ pool });
+    const client = await pool.connect();
+    const provider = "github";
+    const externalId = `evt-rollback-${Date.now()}`;
+    try {
+      await inbox.putOrIgnore(provider, externalId, "run.completed", { externalId });
+      await client.query("BEGIN");
+      const processed = await inbox.markProcessed(provider, externalId, Date.now(), client);
+      assert.equal(processed.status, "PROCESSED");
+      await client.query("ROLLBACK");
+
+      const afterRollback = await inbox.get(provider, externalId);
+      assert.ok(afterRollback, "the inbox row must survive the rollback");
+      assert.equal(afterRollback.status, "RECEIVED", "outer rollback must undo markProcessed");
+    } finally {
+      await client.query("ROLLBACK").catch(() => {});
+      client.release();
+      await pool.end();
+    }
   });
 } else {
   test("[PostgreSQL] handoff+inbox contract suite skipped — set DPC_POSTGRES_URL to enable", { skip: true }, () => {});

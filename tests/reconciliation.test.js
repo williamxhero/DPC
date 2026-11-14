@@ -19,23 +19,13 @@ import {
   PostgresExecutionStore,
   ReconciliationRunner,
 } from "../dist/index.js";
+import { id, makeDescriptor as makeSharedDescriptor } from "./helpers.js";
 
 const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
 
-const id = (v) => v;
-
 function makeDescriptor(actionId, deps = []) {
-  return {
-    actionId: id(actionId),
-    actionType: `reconciliation.${actionId}`,
-    target: { name: actionId },
-    metrics: ["completed"],
-    authorization: { reference: "reconciliation-test", scopes: ["execute"] },
-    stopConditions: ["done"],
-    waitConditions: [],
-    dependencies: deps.map(id),
-  };
+  return makeSharedDescriptor(actionId, deps, "reconciliation");
 }
 
 function makeStore(impl) {
@@ -77,8 +67,7 @@ function runReconciliationSuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         profile,
         clock: () => Date.now(),
@@ -172,6 +161,40 @@ function runReconciliationSuite(label, getStore) {
     }
   });
 
+  test(`[${label}] reconciliation lists expired orphaned claims`, async () => {
+    const { store, cleanup } = getStore();
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const programId = id(`recon-prog-orphan-${ts}-${label}`);
+      const planId = id("recon-plan-orphan");
+      const actionId = id("action-orphan");
+      const eventKey = id(`orphan-event-${ts}`);
+      const identity = {
+        programId,
+        planId,
+        planRevision: id("r1"),
+        actionId,
+        eventKey,
+        nfTaskId: id(`nf-task-orphan-${ts}`),
+        runGeneration: 1,
+        claimFence: 0,
+      };
+      await store.claim(identity, "owner-orphan", ts);
+
+      const runner = new ReconciliationRunner(store);
+      const candidates = await runner.scan(ts + 2_000);
+      const candidate = candidates.find((entry) => entry.kind === "EXPIRED_CLAIM" && entry.eventKey === eventKey);
+      assert.ok(candidate, "an expired claim must be discoverable without an execution row");
+      assert.equal(candidate.programId, programId);
+      assert.equal(candidate.planId, planId);
+      assert.equal(candidate.actionId, actionId);
+      assert.equal(candidate.planRevision, identity.planRevision);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test(`[${label}] reconciliation scan never invokes NF execute`, async () => {
     const { store, cleanup } = getStore();
     try {
@@ -197,8 +220,7 @@ function runReconciliationSuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         profile,
         clock: () => Date.now(),

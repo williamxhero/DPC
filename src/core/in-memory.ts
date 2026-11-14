@@ -21,6 +21,7 @@ import {
   type ProgramId,
   type Receipt,
   type ReconciliationCandidate,
+  type OutboxEvent,
   StaleWriteError,
 } from "./types.js";
 
@@ -45,6 +46,8 @@ export class InMemoryPlanSource implements PlanSource {
 export class InMemoryActionLedger implements ActionLedger {
   private readonly recordsByEvent = new Map<string, ExecutionRecord>();
   private readonly recordsByAction = new Map<string, ExecutionRecord[]>();
+  private readonly receiptsByEvent = new Map<string, Receipt[]>();
+  private readonly outboxByDedupeKey = new Map<string, OutboxEvent>();
 
   public async beginExecution(
     identity: ExecutionIdentity,
@@ -93,6 +96,8 @@ export class InMemoryActionLedger implements ActionLedger {
     if (index >= 0) {
       records[index] = updated;
     }
+    this.receiptsByEvent.set(eventKey, [receipt]);
+    this.recordOutbox(receipt, "RECEIPT_RECORDED");
   }
 
   public async replaceReceiptWithClaim(
@@ -110,6 +115,9 @@ export class InMemoryActionLedger implements ActionLedger {
     if (!this.matchesIdentity(record.identity, expectedIdentity)) {
       throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
     }
+    if (!this.matchesStableIdentity(record.identity, receipt.identity)) {
+      throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
+    }
 
     const updated: ExecutionRecord = {
       ...record,
@@ -123,6 +131,10 @@ export class InMemoryActionLedger implements ActionLedger {
     if (index >= 0) {
       records[index] = updated;
     }
+    const receipts = this.receiptsByEvent.get(eventKey) ?? [];
+    receipts.push(receipt);
+    this.receiptsByEvent.set(eventKey, receipts);
+    this.recordOutbox(receipt, "RECOVERY_RESOLVED");
   }
 
   public async findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined> {
@@ -142,12 +154,48 @@ export class InMemoryActionLedger implements ActionLedger {
     return [...this.recordsByEvent.values()];
   }
 
+  public async listReceipts(
+    programId: ProgramId,
+    planId: PlanId,
+    eventKey: EventKey,
+  ): Promise<readonly Receipt[]> {
+    return [...(this.receiptsByEvent.get(`${programId}:${planId}:${eventKey}`) ?? [])];
+  }
+
+  public async pendingOutbox(): Promise<readonly OutboxEvent[]> {
+    return [...this.outboxByDedupeKey.values()];
+  }
+
+  private recordOutbox(receipt: Receipt, eventType: string): void {
+    const dedupeKey = `${eventType}:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`;
+    if (!this.outboxByDedupeKey.has(dedupeKey)) {
+      this.outboxByDedupeKey.set(dedupeKey, {
+        outboxId: `in-memory-outbox-${this.outboxByDedupeKey.size + 1}`,
+        dedupeKey,
+        eventType,
+        aggregateId: this.eventKey(receipt.identity),
+        status: "PENDING",
+        attempts: 0,
+      });
+    }
+  }
+
   private eventKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.eventKey}`;
   }
 
   private actionKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
+  }
+
+  private matchesStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
+    return left.programId === right.programId
+      && left.planId === right.planId
+      && left.planRevision === right.planRevision
+      && left.actionId === right.actionId
+      && left.eventKey === right.eventKey
+      && left.nfTaskId === right.nfTaskId
+      && left.runGeneration === right.runGeneration;
   }
 
   private matchesIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
@@ -359,6 +407,14 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     return this.ledger.hasBusinessCompletion(programId, planId, actionId);
   }
 
+  public listReceipts(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<readonly Receipt[]> {
+    return this.ledger.listReceipts(programId, planId, eventKey);
+  }
+
+  public pendingOutbox(): Promise<readonly OutboxEvent[]> {
+    return this.ledger.pendingOutbox();
+  }
+
   public claim(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionIdentity> {
     return this.claims.claim(identity, ownerId, now);
   }
@@ -382,49 +438,39 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     for (const record of records) {
       // UNKNOWN receipts
       if (record.receipt && record.receipt.businessStatus === "UNKNOWN") {
-        candidates.push({
-          executionId: this.eventKey(record.identity),
-          programId: record.identity.programId,
-          planId: record.identity.planId,
-          planRevision: record.identity.planRevision,
-          actionId: record.identity.actionId,
-          eventKey: record.identity.eventKey,
-          kind: "UNKNOWN_RECEIPT",
-          observedAt: record.receipt.recordedAt,
-        });
+        candidates.push(this.makeCandidate(record.identity, "UNKNOWN_RECEIPT", record.receipt.recordedAt));
       }
 
       // STARTED without receipt
       if (record.lifecycle === "STARTED" && !record.receipt) {
-        candidates.push({
-          executionId: this.eventKey(record.identity),
-          programId: record.identity.programId,
-          planId: record.identity.planId,
-          planRevision: record.identity.planRevision,
-          actionId: record.identity.actionId,
-          eventKey: record.identity.eventKey,
-          kind: "STARTED_WITHOUT_RECEIPT",
-          observedAt: now,
-        });
+        candidates.push(this.makeCandidate(record.identity, "STARTED_WITHOUT_RECEIPT", now));
       }
 
     }
 
     // Expired claims — use the public seam, not the private map
     for (const { identity } of this.claims.listExpiredClaims(now)) {
-      candidates.push({
-        executionId: this.eventKey(identity),
-        programId: identity.programId,
-        planId: identity.planId,
-        planRevision: identity.planRevision,
-        actionId: identity.actionId,
-        eventKey: identity.eventKey,
-        kind: "EXPIRED_CLAIM",
-        observedAt: now,
-      });
+      candidates.push(this.makeCandidate(identity, "EXPIRED_CLAIM", now));
     }
 
     return candidates;
+  }
+
+  private makeCandidate(
+    identity: ExecutionIdentity,
+    kind: ReconciliationCandidate["kind"],
+    observedAt: number,
+  ): ReconciliationCandidate {
+    return {
+      executionId: this.eventKey(identity),
+      programId: identity.programId,
+      planId: identity.planId,
+      planRevision: identity.planRevision,
+      actionId: identity.actionId,
+      eventKey: identity.eventKey,
+      kind,
+      observedAt,
+    };
   }
 
   private eventKey(identity: ExecutionIdentity): string {

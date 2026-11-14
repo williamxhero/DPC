@@ -152,6 +152,15 @@ export interface ExecutionRecord {
   readonly receipt?: Receipt;
 }
 
+export interface OutboxEvent {
+  readonly outboxId: string;
+  readonly dedupeKey: string;
+  readonly eventType: string;
+  readonly aggregateId: string;
+  readonly status: string;
+  readonly attempts: number;
+}
+
 export interface PlanSource {
   read(programId: ProgramId, planId: PlanId): Promise<PlanSnapshot>;
 }
@@ -314,6 +323,16 @@ export interface DurableExecutionStore extends ActionLedger, ClaimAuthority {
    * Safe to call on every startup — idempotent, never destructive.
    */
   migrate(): Promise<void>;
+
+  /** Return every receipt retained for one execution, oldest first. */
+  listReceipts(
+    programId: ProgramId,
+    planId: PlanId,
+    eventKey: EventKey,
+  ): Promise<readonly Receipt[]>;
+
+  /** Return committed coordination notifications that have not been delivered. */
+  pendingOutbox(): Promise<readonly OutboxEvent[]>;
 
   /**
    * List reconciliation candidates: UNKNOWN receipts, STARTED executions without

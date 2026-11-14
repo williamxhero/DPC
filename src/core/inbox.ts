@@ -2,6 +2,11 @@ import { StaleWriteError } from "./types.js";
 
 export type InboxEventStatus = "RECEIVED" | "PROCESSED";
 
+/** Minimal transaction client shape used to compose inbox updates with execution writes. */
+export interface InboxQueryable {
+  query<T = unknown>(...args: any[]): Promise<{ readonly rows: readonly T[] }>;
+}
+
 export interface InboxOccurrence {
   readonly provider: string;
   readonly externalEventId: string;
@@ -64,6 +69,7 @@ export interface InboxStore {
     provider: string,
     externalEventId: string,
     processedAt: number,
+    txClient?: InboxQueryable,
   ): Promise<InboxOccurrence>;
 }
 
@@ -105,6 +111,7 @@ export class InMemoryInboxStore implements InboxStore {
     provider: string,
     externalEventId: string,
     processedAt: number,
+    _txClient?: InboxQueryable,
   ): Promise<InboxOccurrence> {
     const k = InMemoryInboxStore.key(provider, externalEventId);
     const existing = this.occurrences.get(k);

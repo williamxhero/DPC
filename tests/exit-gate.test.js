@@ -144,10 +144,9 @@ function durableCore({
   const selectedProfile = profile ?? new InMemoryProfile(actions);
   const core = new DpcCore({
     plans: source,
-    ledger: store,
+    store,
     nf,
     profile: selectedProfile,
-    claims: store,  // <-- same store object; not NoopClaimAuthority or separate InMemoryClaimAuthority
     clock,
     recovery,
   });
@@ -222,8 +221,8 @@ test("[T6/INV-ID-1] event-key idempotency is scoped by program+plan — same key
   const nfA = new InMemoryNfRuntime({ status: "DONE", evidence: [] });
   const nfB = new InMemoryNfRuntime({ status: "DONE", evidence: [] });
 
-  const coreA = new DpcCore({ plans: planA, ledger: storeA, nf: nfA, profile: new InMemoryProfile(actionsA), claims: storeA, clock: fixedClock });
-  const coreB = new DpcCore({ plans: planB, ledger: storeB, nf: nfB, profile: new InMemoryProfile(actionsB), claims: storeB, clock: fixedClock });
+  const coreA = new DpcCore({ plans: planA, store: storeA, nf: nfA, profile: new InMemoryProfile(actionsA), clock: fixedClock });
+  const coreB = new DpcCore({ plans: planB, store: storeB, nf: nfB, profile: new InMemoryProfile(actionsB), clock: fixedClock });
 
   const sharedEventKey = id("trigger-shared");
 
@@ -296,10 +295,9 @@ test("[T6/INV-ORD-1,INV-ORD-3] durable Core enforces claim fencing — stale fen
   // First dispatch succeeds normally
   const first = await new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
   }).dispatch({
     programId: id("program-1"),
@@ -311,10 +309,9 @@ test("[T6/INV-ORD-1,INV-ORD-3] durable Core enforces claim fencing — stale fen
   // The event key is now COMPLETED so a second dispatch is a DUPLICATE
   const second = await new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
   }).dispatch({
     programId: id("program-1"),
@@ -350,10 +347,9 @@ test("[T6/INV-REC-1,INV-REC-2] recover() on UNKNOWN uses readback only — NF is
   const nf = unknownNf;
   const core = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
     // readback returns undefined => STILL_UNKNOWN
     recovery: { readback: async () => undefined },
@@ -387,10 +383,9 @@ test("[T6/INV-REC-3,INV-REC-4] STILL_UNKNOWN does not overwrite original UNKNOWN
   const nf = new InMemoryNfRuntime({ status: "UNKNOWN", evidence: [] });
   const core = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
     recovery: { readback: async () => undefined },
   });
@@ -426,10 +421,9 @@ test("[T6/INV-REC-1,INV-ID-2] successful recovery uses readback and produces a C
   const readbackNf = new InMemoryNfRuntime({ status: "DONE", evidence: [] });
   const core = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
     recovery: { readback: (req) => readbackNf.execute(req) },
   });
@@ -542,10 +536,9 @@ test("[T6/INV-REC-3] reconciliation candidates include UNKNOWN_RECEIPT after UNK
   const nf = new InMemoryNfRuntime({ status: "UNKNOWN", evidence: [] });
   const core = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
     recovery: { readback: async () => undefined },
   });
@@ -584,10 +577,9 @@ test("[T6/exit-gate-evidence] full dispatch→duplicate→recovery→reconciliat
 
   const coreNormal = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf: normalNf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
   });
 
@@ -611,10 +603,9 @@ test("[T6/exit-gate-evidence] full dispatch→duplicate→recovery→reconciliat
   // 3. Second action with UNKNOWN outcome
   const coreUnknown = new DpcCore({
     plans: new InMemoryPlanSource(plan(actions)),
-    ledger: store,
+    store,
     nf: unknownNf,
     profile: new InMemoryProfile(actions),
-    claims: store,
     clock: fixedClock,
     recovery: { readback: async () => undefined },
   });

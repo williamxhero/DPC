@@ -16,6 +16,7 @@ import type {
   ProgramId,
   Receipt,
   ReconciliationCandidate,
+  OutboxEvent,
 } from "../../core/types.js";
 import {
   ClaimConflictError,
@@ -28,6 +29,8 @@ export interface PostgresExecutionStoreConfig extends PoolConfig {
   readonly pool?: PgPool;
   readonly clock?: () => number;
   readonly leaseDurationMs?: number;
+  readonly lockTimeoutMs?: number;
+  readonly statementTimeoutMs?: number;
 }
 
 type Queryable = Pick<PoolClient, "query">;
@@ -57,6 +60,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
   private readonly ownsPool: boolean;
   private readonly clock: () => number;
   private readonly leaseDurationMs: number;
+  private readonly lockTimeoutMs: number;
+  private readonly statementTimeoutMs: number;
 
   public constructor(config: PostgresExecutionStoreConfig) {
     if (config.pool) {
@@ -68,14 +73,18 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     }
     this.clock = config.clock ?? (() => Date.now());
     this.leaseDurationMs = config.leaseDurationMs ?? 30_000;
+    this.lockTimeoutMs = this.timeoutValue(config.lockTimeoutMs ?? 5_000, "lockTimeoutMs");
+    this.statementTimeoutMs = this.timeoutValue(config.statementTimeoutMs ?? 30_000, "statementTimeoutMs");
   }
 
   public async migrate(): Promise<void> {
-    await this.pool.query(INITIAL_SCHEMA_SQL);
-    await this.pool.query(
-      "INSERT INTO dpc_schema_migrations(version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
-      [1],
-    );
+    await this.transaction(async (client) => {
+      await client.query(INITIAL_SCHEMA_SQL);
+      await client.query(
+        "INSERT INTO dpc_schema_migrations(version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+        [1],
+      );
+    });
   }
 
   public async close(): Promise<void> {
@@ -127,8 +136,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!this.sameStableIdentity(execution.identity, receipt.identity)) {
         throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
       }
-      await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
-      await this.updateExecution(client, execution.execution_id, receipt);
+      const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
+      await this.updateExecution(client, execution.execution_id, receipt, receiptId);
       await this.insertOutbox(client, `receipt:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECEIPT_RECORDED", execution.execution_id, receipt);
       await this.deleteClaim(client, receipt.identity);
     });
@@ -152,8 +161,11 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!this.sameStableIdentity(execution.receipt.identity, expectedIdentity)) {
         throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
       }
-      await this.insertReceipt(client, execution.execution_id, receipt, "RECOVERY_READBACK");
-      await this.updateExecution(client, execution.execution_id, receipt);
+      if (!this.sameStableIdentity(expectedIdentity, receipt.identity)) {
+        throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
+      }
+      const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "RECOVERY_READBACK");
+      await this.updateExecution(client, execution.execution_id, receipt, receiptId);
       await this.insertOutbox(client, `recovery:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECOVERY_RESOLVED", execution.execution_id, receipt);
       await this.deleteClaim(client, receipt.identity);
     });
@@ -174,6 +186,22 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       [programId, planId, actionId],
     );
     return result.rows[0] ? this.mapExecution(result.rows[0]) : undefined;
+  }
+
+  public async listReceipts(
+    programId: ProgramId,
+    planId: PlanId,
+    eventKey: EventKey,
+  ): Promise<readonly Receipt[]> {
+    const result = await this.pool.query<{ receipt_json: Receipt }>(
+      `SELECT r.receipt_json
+       FROM dpc_action_receipts r
+       JOIN dpc_action_executions e ON e.execution_id = r.execution_id
+       WHERE e.program_id = $1 AND e.plan_id = $2 AND e.event_key = $3
+       ORDER BY r.recorded_at ASC, r.receipt_id ASC`,
+      [programId, planId, eventKey],
+    );
+    return result.rows.map((row) => row.receipt_json);
   }
 
   public async hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean> {
@@ -225,12 +253,14 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       );
       await client.query(
         `INSERT INTO dpc_claims
-          (program_id, plan_id, action_id, owner_id, claim_fence, event_key, run_generation, lease_until)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+          (program_id, plan_id, action_id, owner_id, claim_fence, event_key, plan_revision, nf_task_id, run_generation, lease_until)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
          ON CONFLICT (program_id, plan_id, action_id)
          DO UPDATE SET owner_id = EXCLUDED.owner_id,
                        claim_fence = EXCLUDED.claim_fence,
                        event_key = EXCLUDED.event_key,
+                       plan_revision = EXCLUDED.plan_revision,
+                       nf_task_id = EXCLUDED.nf_task_id,
                        run_generation = EXCLUDED.run_generation,
                        lease_until = EXCLUDED.lease_until,
                        updated_at = now()`,
@@ -239,6 +269,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
           ownerId,
           fence,
           identity.eventKey,
+          identity.planRevision,
+          identity.nfTaskId,
           identity.runGeneration,
           new Date(now + this.leaseDurationMs),
         ],
@@ -251,10 +283,12 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     const result = await this.pool.query<{
       claim_fence: number;
       event_key: string;
+      plan_revision: string;
+      nf_task_id: string;
       run_generation: number;
       lease_until: Date;
     }>(
-      `SELECT claim_fence, event_key, run_generation, lease_until
+      `SELECT claim_fence, event_key, plan_revision, nf_task_id, run_generation, lease_until
        FROM dpc_claims
        WHERE program_id = $1 AND plan_id = $2 AND action_id = $3`,
       [identity.programId, identity.planId, identity.actionId],
@@ -263,6 +297,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     if (!row
       || row.claim_fence !== identity.claimFence
       || row.event_key !== identity.eventKey
+      || row.plan_revision !== identity.planRevision
+      || row.nf_task_id !== identity.nfTaskId
       || row.run_generation !== identity.runGeneration
       || row.lease_until.getTime() <= now) {
       throw new StaleWriteError(`Claim fence is stale for ${identity.actionId}`);
@@ -285,9 +321,10 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     );
   }
 
-  public async pendingOutbox(): Promise<readonly Record<string, unknown>[]> {
-    const result = await this.pool.query(
-      `SELECT outbox_id, dedupe_key, event_type, aggregate_id, status, attempts
+  public async pendingOutbox(): Promise<readonly OutboxEvent[]> {
+    const result = await this.pool.query<OutboxEvent>(
+      `SELECT outbox_id AS "outboxId", dedupe_key AS "dedupeKey", event_type AS "eventType",
+              aggregate_id AS "aggregateId", status, attempts
        FROM dpc_outbox_events ORDER BY created_at`,
     );
     return result.rows;
@@ -295,38 +332,53 @@ export class PostgresExecutionStore implements DurableExecutionStore {
 
   public async listReconciliationCandidates(now: number): Promise<readonly ReconciliationCandidate[]> {
     const result = await this.pool.query<{
-      execution_id: string;
+      execution_id: string | null;
       program_id: string;
       plan_id: string;
       plan_revision: string;
       action_id: string;
       event_key: string;
+      nf_task_id: string;
+      run_generation: number;
+      claim_fence: number;
       kind: ReconciliationCandidate["kind"];
     }>(
       `SELECT execution_id, program_id, plan_id, plan_revision, action_id, event_key,
-              'UNKNOWN_RECEIPT' AS kind
+              nf_task_id, run_generation, claim_fence, 'UNKNOWN_RECEIPT' AS kind
        FROM dpc_action_executions
        WHERE lifecycle = 'UNKNOWN'
        UNION ALL
        SELECT execution_id, program_id, plan_id, plan_revision, action_id, event_key,
-              'STARTED_WITHOUT_RECEIPT' AS kind
+              nf_task_id, run_generation, claim_fence, 'STARTED_WITHOUT_RECEIPT' AS kind
        FROM dpc_action_executions
        WHERE lifecycle = 'STARTED' AND current_receipt_id IS NULL
        UNION ALL
-       SELECT e.execution_id, e.program_id, e.plan_id, e.plan_revision, e.action_id, e.event_key,
-              'EXPIRED_CLAIM' AS kind
+       SELECT e.execution_id, c.program_id, c.plan_id,
+              COALESCE(c.plan_revision, e.plan_revision, 'unknown'),
+              c.action_id, c.event_key,
+              COALESCE(c.nf_task_id, e.nf_task_id, 'unknown'),
+              c.run_generation, c.claim_fence, 'EXPIRED_CLAIM' AS kind
        FROM dpc_claims c
-       JOIN dpc_action_executions e
+       LEFT JOIN dpc_action_executions e
          ON e.program_id = c.program_id
         AND e.plan_id = c.plan_id
         AND e.action_id = c.action_id
         AND e.event_key = c.event_key
        WHERE c.lease_until <= $1
-       ORDER BY execution_id, kind`,
+       ORDER BY execution_id NULLS LAST, kind`,
       [new Date(now)],
     );
     return result.rows.map((row) => ({
-      executionId: row.execution_id,
+      executionId: row.execution_id ?? this.executionId({
+        programId: row.program_id as ProgramId,
+        planId: row.plan_id as PlanId,
+        planRevision: row.plan_revision as ExecutionIdentity["planRevision"],
+        actionId: row.action_id as ActionId,
+        eventKey: row.event_key as EventKey,
+        nfTaskId: row.nf_task_id as ExecutionIdentity["nfTaskId"],
+        runGeneration: row.run_generation,
+        claimFence: row.claim_fence,
+      }),
       programId: row.program_id as ReconciliationCandidate["programId"],
       planId: row.plan_id as ReconciliationCandidate["planId"],
       planRevision: row.plan_revision as ReconciliationCandidate["planRevision"],
@@ -341,10 +393,12 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     const result = await client.query<{
       claim_fence: number;
       event_key: string;
+      plan_revision: string;
+      nf_task_id: string;
       run_generation: number;
       lease_until: Date;
     }>(
-      `SELECT claim_fence, event_key, run_generation, lease_until
+      `SELECT claim_fence, event_key, plan_revision, nf_task_id, run_generation, lease_until
        FROM dpc_claims
        WHERE program_id = $1 AND plan_id = $2 AND action_id = $3
        FOR UPDATE`,
@@ -354,6 +408,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     if (!row
       || row.claim_fence !== identity.claimFence
       || row.event_key !== identity.eventKey
+      || row.plan_revision !== identity.planRevision
+      || row.nf_task_id !== identity.nfTaskId
       || row.run_generation !== identity.runGeneration
       || row.lease_until.getTime() <= now) {
       throw new StaleWriteError(`Claim fence is stale for ${identity.actionId}`);
@@ -369,13 +425,14 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     );
   }
 
-  private async insertReceipt(client: Queryable, executionId: string, receipt: Receipt, kind: string): Promise<void> {
-    await client.query(
+  private async insertReceipt(client: Queryable, executionId: string, receipt: Receipt, kind: string): Promise<string> {
+    const result = await client.query<{ receipt_id: string }>(
       `INSERT INTO dpc_action_receipts
         (receipt_id, execution_id, program_id, plan_id, plan_revision, action_id,
          event_key, nf_task_id, run_generation, claim_fence, receipt_kind,
          nf_status, business_status, receipt_json, recorded_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       RETURNING receipt_id`,
       [
         randomUUID(),
         executionId,
@@ -394,20 +451,25 @@ export class PostgresExecutionStore implements DurableExecutionStore {
         new Date(receipt.recordedAt),
       ],
     );
+    const receiptId = result.rows[0]?.receipt_id;
+    if (!receiptId) throw new DpcAdapterError("PostgreSQL receipt insert returned no receipt id");
+    return receiptId;
   }
 
-  private async updateExecution(client: Queryable, executionId: string, receipt: Receipt): Promise<void> {
+  private async updateExecution(
+    client: Queryable,
+    executionId: string,
+    receipt: Receipt,
+    receiptId: string,
+  ): Promise<void> {
     await client.query(
       `UPDATE dpc_action_executions
        SET lifecycle = $2,
            claim_fence = $3,
-           current_receipt_id = (
-             SELECT receipt_id FROM dpc_action_receipts
-             WHERE execution_id = $1 ORDER BY recorded_at DESC LIMIT 1
-           ),
+           current_receipt_id = $4,
            updated_at = now()
        WHERE execution_id = $1`,
-      [executionId, this.lifecycleFor(receipt), receipt.identity.claimFence],
+      [executionId, this.lifecycleFor(receipt), receipt.identity.claimFence, receiptId],
     );
   }
 
@@ -491,6 +553,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query("SELECT set_config('lock_timeout', $1, true)", [`${this.lockTimeoutMs}ms`]);
+      await client.query("SELECT set_config('statement_timeout', $1, true)", [`${this.statementTimeoutMs}ms`]);
       const result = await operation(client);
       await client.query("COMMIT");
       return result;
@@ -500,5 +564,12 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     } finally {
       client.release();
     }
+  }
+
+  private timeoutValue(value: number, name: string): number {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new DpcAdapterError(`${name} must be a non-negative integer`);
+    }
+    return value;
   }
 }

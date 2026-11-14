@@ -21,23 +21,13 @@ import {
   PostgresExecutionStore,
   RecoveryError,
 } from "../dist/index.js";
+import { id, makeDescriptor as makeSharedDescriptor } from "./helpers.js";
 
 const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
 
-const id = (v) => v;
-
 function makeDescriptor(actionId, deps = []) {
-  return {
-    actionId: id(actionId),
-    actionType: `recovery.${actionId}`,
-    target: { name: actionId },
-    metrics: ["completed"],
-    authorization: { reference: "recovery-test", scopes: ["execute"] },
-    stopConditions: ["done"],
-    waitConditions: [],
-    dependencies: deps.map(id),
-  };
+  return makeSharedDescriptor(actionId, deps, "recovery");
 }
 
 function makeStore(impl) {
@@ -89,8 +79,7 @@ function runRecoverySuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         recovery,
         profile,
@@ -141,8 +130,7 @@ function runRecoverySuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         recovery,
         profile,
@@ -190,8 +178,7 @@ function runRecoverySuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         recovery,
         profile,
@@ -233,8 +220,7 @@ function runRecoverySuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: { execute: async () => ({ status: "DONE", evidence: [] }) },
         recovery: { readback: async () => ({ status: "DONE", evidence: [] }) },
         profile,
@@ -274,8 +260,7 @@ function runRecoverySuite(label, getStore) {
       const source = new InMemoryPlanSource(plan);
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         recovery: { readback: async () => ({ status: "DONE", evidence: [] }) },
         profile,

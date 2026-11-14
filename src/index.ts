@@ -19,7 +19,7 @@ export { InMemoryWakeStore, WakeCoordinator } from "./core/wake.js";
 export { ReconciliationRunner } from "./core/reconciliation.js";
 export { HandoffBlockedError, HandoffCoordinator, InMemoryHandoffStore } from "./core/handoff.js";
 export { InMemoryInboxStore } from "./core/inbox.js";
-export type { InboxEventStatus, InboxOccurrence, InboxStore } from "./core/inbox.js";
+export type { InboxEventStatus, InboxOccurrence, InboxQueryable, InboxStore } from "./core/inbox.js";
 export { inspectProfileConformance } from "./core/standard-kit.js";
 export { InMemoryProjectionAdapter } from "./core/projection.js";
 export type { ConformanceCheck, ProfileConformanceReport } from "./core/standard-kit.js";

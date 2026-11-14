@@ -49,11 +49,16 @@ CREATE TABLE IF NOT EXISTS dpc_claims (
   owner_id TEXT NOT NULL,
   claim_fence INTEGER NOT NULL,
   event_key TEXT NOT NULL,
+  plan_revision TEXT NOT NULL,
+  nf_task_id TEXT NOT NULL,
   run_generation INTEGER NOT NULL,
   lease_until TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (program_id, plan_id, action_id)
 );
+
+ALTER TABLE dpc_claims ADD COLUMN IF NOT EXISTS plan_revision TEXT;
+ALTER TABLE dpc_claims ADD COLUMN IF NOT EXISTS nf_task_id TEXT;
 
 CREATE TABLE IF NOT EXISTS dpc_claim_fences (
   program_id TEXT NOT NULL,

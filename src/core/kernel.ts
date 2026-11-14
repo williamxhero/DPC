@@ -4,6 +4,7 @@ import {
   type ActionLedger,
   type BusinessInterpretation,
   type ClaimAuthority,
+  type DurableExecutionStore,
   type DispatchRequest,
   type DispatchResult,
   DpcAdapterError,
@@ -26,16 +27,29 @@ import {
 const INITIAL_RUN_GENERATION = 1;
 const PROVISIONAL_CLAIM_FENCE = 0;
 
-export interface DpcCoreDependencies {
+interface DpcCoreCommonDependencies {
   readonly plans: PlanSource;
-  readonly ledger: ActionLedger;
   readonly nf: NfActionRuntime;
   readonly profile: Profile;
-  readonly claims: ClaimAuthority;
   readonly recovery?: import("./types.js").RecoveryAdapter;
   readonly ownerId?: string;
   readonly clock?: () => number;
 }
+
+export type DpcCoreDependencies = DpcCoreCommonDependencies & (
+  | {
+      /** Preferred durable path: one store owns claims and atomic receipt writes. */
+      readonly store: DurableExecutionStore;
+      readonly ledger?: never;
+      readonly claims?: never;
+    }
+  | {
+      /** Legacy T1/T2 path retained for non-durable adapters. */
+      readonly ledger: ActionLedger;
+      readonly claims: ClaimAuthority;
+      readonly store?: never;
+    }
+);
 
 /**
  * The DPC module. One dispatch advances one action occurrence and returns the
@@ -43,12 +57,19 @@ export interface DpcCoreDependencies {
  */
 export class DpcCore {
   private readonly clock: () => number;
+  private readonly ledger: ActionLedger;
   private readonly claims: ClaimAuthority;
   private readonly ownerId: string;
 
   public constructor(private readonly dependencies: DpcCoreDependencies) {
     this.clock = dependencies.clock ?? (() => Date.now());
-    this.claims = dependencies.claims;
+    if (dependencies.store) {
+      this.ledger = dependencies.store;
+      this.claims = dependencies.store;
+    } else {
+      this.ledger = dependencies.ledger;
+      this.claims = dependencies.claims;
+    }
     this.ownerId = dependencies.ownerId ?? "dpc-core";
   }
 
@@ -57,7 +78,7 @@ export class DpcCore {
     const descriptors = this.readDescriptors(plan);
     this.validateDescriptors(descriptors);
 
-    const duplicate = await this.dependencies.ledger.findByEventKey(
+    const duplicate = await this.ledger.findByEventKey(
       request.programId,
       request.planId,
       request.eventKey,
@@ -71,7 +92,7 @@ export class DpcCore {
       return { status: "NO_ELIGIBLE_ACTION", planRevision: plan.revision };
     }
 
-    const previous = await this.dependencies.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
+    const previous = await this.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
     const identity = this.createIdentity(
       request,
       plan,
@@ -81,7 +102,7 @@ export class DpcCore {
     const claimed = await this.claim(identity, request.now ?? this.clock());
     let started;
     try {
-      started = await this.dependencies.ledger.beginExecution(claimed, action);
+      started = await this.ledger.beginExecution(claimed, action);
     } catch (error) {
       await this.release(claimed);
       throw new DpcAdapterError(`Failed to begin execution for ${action.actionId}`, error);
@@ -136,7 +157,7 @@ export class DpcCore {
    * NF execute seam, so callers cannot accidentally repeat a side effect.
    */
   public async recover(request: RecoveryRequest): Promise<RecoveryResult> {
-    const record = await this.dependencies.ledger.findByEventKey(
+    const record = await this.ledger.findByEventKey(
       request.programId,
       request.planId,
       request.eventKey,
@@ -181,7 +202,7 @@ export class DpcCore {
         const interpretation = this.interpret(plan, record.action, result, gate);
         return this.createReceipt(claimed, record.action, result, interpretation);
       });
-      await this.dependencies.ledger.replaceReceiptWithClaim(
+      await this.ledger.replaceReceiptWithClaim(
         record.identity,
         receipt,
         this.claims,
@@ -260,7 +281,7 @@ export class DpcCore {
     now: number,
   ): Promise<ActionDescriptor | undefined> {
     for (const action of descriptors) {
-      const record = await this.dependencies.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
+      const record = await this.ledger.findLatestForAction(plan.programId, plan.planId, action.actionId);
       if (record && this.isBlockedByRecord(record)) {
         continue;
       }
@@ -273,7 +294,7 @@ export class DpcCore {
 
       let dependenciesComplete = true;
       for (const dependency of action.dependencies) {
-        if (!(await this.dependencies.ledger.hasBusinessCompletion(plan.programId, plan.planId, dependency))) {
+        if (!(await this.ledger.hasBusinessCompletion(plan.programId, plan.planId, dependency))) {
           dependenciesComplete = false;
           break;
         }
@@ -352,7 +373,7 @@ export class DpcCore {
           const interpretation = this.interpret(plan, action, failed, gate);
           return this.createReceipt(identity, action, failed, interpretation);
         });
-        await this.dependencies.ledger.appendReceiptWithClaim(
+        await this.ledger.appendReceiptWithClaim(
           failureReceipt,
           this.claims,
           this.clock(),
@@ -385,7 +406,7 @@ export class DpcCore {
       return this.createReceipt(identity, action, result, interpretation);
     });
     try {
-      await this.dependencies.ledger.appendReceiptWithClaim(receipt, this.claims, this.clock());
+      await this.ledger.appendReceiptWithClaim(receipt, this.claims, this.clock());
     } catch (error) {
       if (error instanceof StaleWriteError) throw error;
       throw new DpcAdapterError("Failed to write the action receipt", error);

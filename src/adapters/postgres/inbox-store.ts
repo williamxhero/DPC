@@ -1,6 +1,6 @@
-import type { Pool, PoolClient } from "pg";
+import type { Pool } from "pg";
 import { StaleWriteError } from "../../core/types.js";
-import type { InboxOccurrence, InboxStore } from "../../core/inbox.js";
+import type { InboxOccurrence, InboxQueryable, InboxStore } from "../../core/inbox.js";
 
 interface InboxRow {
   provider: string;
@@ -93,7 +93,7 @@ export class PostgresInboxStore implements InboxStore {
     provider: string,
     externalEventId: string,
     processedAt: number,
-    client?: Pick<PoolClient, "query">,
+    client?: InboxQueryable,
   ): Promise<InboxOccurrence> {
     const queryable = client ?? this.pool;
     const result = await queryable.query<InboxRow>(

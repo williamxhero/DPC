@@ -58,8 +58,7 @@ test("PostgreSQL durable execution survives UNKNOWN recovery and dedupe", {
   };
   const core = new DpcCore({
     plans: source,
-    ledger: store,
-    claims: store,
+    store,
     nf: runtime,
     recovery: runtime,
     profile: new InMemoryProfile([first, second]),

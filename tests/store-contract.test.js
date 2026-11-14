@@ -34,6 +34,7 @@ import {
   PostgresExecutionStore,
   StaleWriteError,
 } from "../dist/index.js";
+import { id, makeDescriptor as makeSharedDescriptor } from "./helpers.js";
 
 const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
@@ -41,22 +42,11 @@ const connectionString = process.env.DPC_POSTGRES_URL;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const id = (v) => v;
-
 function makeDescriptor(actionId, deps = []) {
-  return {
-    actionId: id(actionId),
-    actionType: `contract.${actionId}`,
-    target: { name: actionId },
-    metrics: ["completed"],
-    authorization: { reference: "contract-test", scopes: ["execute"] },
-    stopConditions: ["done"],
-    waitConditions: [],
-    dependencies: deps.map(id),
-  };
+  return makeSharedDescriptor(actionId, deps, "contract");
 }
 
-function makeStore(impl, suffix) {
+function makeStore(impl) {
   if (impl === "memory") {
     return { store: new InMemoryDurableStore(), cleanup: async () => {} };
   }
@@ -86,8 +76,7 @@ function makeCoreWith(store, planSnapshot, nfResponse) {
   };
   const core = new DpcCore({
     plans: source,
-    ledger: store,
-    claims: store,
+    store,
     nf: runtime,
     profile,
     clock: () => Date.now(),
@@ -136,8 +125,7 @@ function runContractSuite(label, getStore) {
       };
       const core = new DpcCore({
         plans: source,
-        ledger: store,
-        claims: store,
+        store,
         nf: runtime,
         profile,
         clock: () => Date.now(),
@@ -189,7 +177,7 @@ function runContractSuite(label, getStore) {
             return { status: "DONE", evidence: [], identity: req.identity };
           },
         };
-        return new DpcCore({ plans: source, ledger: store, claims: store, nf: runtime, profile, clock: () => Date.now() });
+        return new DpcCore({ plans: source, store, nf: runtime, profile, clock: () => Date.now() });
       }
 
       const sharedEventKey = id("shared-event-key");
@@ -217,15 +205,16 @@ function runContractSuite(label, getStore) {
       const identity = { programId, planId, planRevision, actionId, eventKey, nfTaskId, runGeneration: 1, claimFence: 0 };
 
       const now = Date.now();
-      // First owner claims successfully
-      const claimed = await store.claim(identity, "owner-a", now);
-      assert.ok(claimed.claimFence > 0, "fence must be positive after first claim");
-
-      // Second owner must be rejected
-      await assert.rejects(
-        () => store.claim(identity, "owner-b", now),
-        ClaimConflictError,
-      );
+      const attempts = await Promise.allSettled([
+        store.claim(identity, "owner-a", now),
+        store.claim(identity, "owner-b", now),
+      ]);
+      const successes = attempts.filter((attempt) => attempt.status === "fulfilled");
+      const failures = attempts.filter((attempt) => attempt.status === "rejected");
+      assert.equal(successes.length, 1, "exactly one concurrent claimer must win");
+      assert.equal(failures.length, 1, "exactly one concurrent claimer must lose");
+      assert.ok(successes[0].value.claimFence > 0, "winning fence must be positive");
+      assert.ok(failures[0].reason instanceof ClaimConflictError, "loser must receive ClaimConflictError");
     } finally {
       await cleanup();
     }
@@ -319,7 +308,7 @@ function runContractSuite(label, getStore) {
         },
       };
       const source = new InMemoryPlanSource(plan);
-      const core = new DpcCore({ plans: source, ledger: store, claims: store, nf: runtime, profile, clock: () => Date.now() });
+      const core = new DpcCore({ plans: source, store, nf: runtime, profile, clock: () => Date.now() });
 
       // First dispatch succeeds and writes a receipt
       const first = await core.dispatch({ programId: plan.programId, planId: plan.planId, eventKey: id("ao-event") });
@@ -421,7 +410,7 @@ function runContractSuite(label, getStore) {
         }),
       };
       const source = new InMemoryPlanSource(plan);
-      const core = new DpcCore({ plans: source, ledger: store, claims: store, nf: runtime, profile, clock: () => Date.now() });
+      const core = new DpcCore({ plans: source, store, nf: runtime, profile, clock: () => Date.now() });
 
       const result = await core.dispatch({ programId: plan.programId, planId: plan.planId, eventKey: id("nb-event") });
       assert.equal(result.status, "DISPATCHED");
@@ -483,6 +472,131 @@ function runContractSuite(label, getStore) {
     }
   });
 
+  test(`[${label}] T2: recovery retains receipt history and exact current pointer`, async () => {
+    const { store, cleanup } = getStore("receipt-history");
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const programId = id(`contract-prog-rh-${ts}-${label}`);
+      const planId = id("contract-plan-rh");
+      const actionId = id("action-rh");
+      const eventKey = id(`receipt-history-event-${ts}`);
+      const planRevision = id("r1");
+      const nfTaskId = id(`nf-rh-${ts}`);
+      const descriptor = makeDescriptor(actionId);
+      const provisional = {
+        programId,
+        planId,
+        planRevision,
+        actionId,
+        eventKey,
+        nfTaskId,
+        runGeneration: 1,
+        claimFence: 0,
+      };
+
+      const recordedAt = ts;
+      const firstClaim = await store.claim(provisional, "owner-rh-a", recordedAt);
+      await store.beginExecution(firstClaim, descriptor);
+      const unknownReceipt = {
+        identity: firstClaim,
+        actionType: descriptor.actionType,
+        nfStatus: "UNKNOWN",
+        businessStatus: "UNKNOWN",
+        evidence: [],
+        recordedAt,
+      };
+      await store.appendReceiptWithClaim(unknownReceipt, store, recordedAt);
+      const afterUnknown = await store.findByEventKey(programId, planId, eventKey);
+      assert.equal(afterUnknown?.receipt?.businessStatus, "UNKNOWN");
+      await store.release(firstClaim);
+
+      const recoveryClaim = await store.claim(provisional, "owner-rh-b", recordedAt + 1);
+      const recoveryReceipt = {
+        ...unknownReceipt,
+        identity: recoveryClaim,
+        nfStatus: "DONE",
+        businessStatus: "COMPLETED",
+        recordedAt,
+      };
+      await store.replaceReceiptWithClaim(firstClaim, recoveryReceipt, store, recordedAt + 1);
+
+      const current = await store.findByEventKey(programId, planId, eventKey);
+      assert.equal(current?.receipt?.businessStatus, "COMPLETED");
+      assert.equal(current?.receipt?.identity.claimFence, recoveryClaim.claimFence);
+      const history = await store.listReceipts(programId, planId, eventKey);
+      assert.equal(history.length, 2, "the UNKNOWN receipt must remain in append-only history");
+      assert.deepEqual(
+        new Set(history.map((receipt) => receipt.businessStatus)),
+        new Set(["UNKNOWN", "COMPLETED"]),
+      );
+      assert.ok(history.some((receipt) => receipt.identity.claimFence === firstClaim.claimFence));
+      assert.ok(history.some((receipt) => receipt.identity.claimFence === recoveryClaim.claimFence));
+
+      const outbox = (await store.pendingOutbox()).filter((event) => event.dedupeKey.includes(eventKey));
+      assert.deepEqual(
+        new Set(outbox.map((event) => event.eventType)),
+        new Set(["RECEIPT_RECORDED", "RECOVERY_RESOLVED"]),
+        "receipt and recovery outbox events must both be observable",
+      );
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test(`[${label}] T2: recovery rejects replacement receipt with stale stable identity`, async () => {
+    const { store, cleanup } = getStore("recovery-stable-identity");
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const programId = id(`contract-prog-rsi-${ts}-${label}`);
+      const planId = id("contract-plan-rsi");
+      const actionId = id("action-rsi");
+      const eventKey = id(`recovery-stable-event-${ts}`);
+      const provisional = {
+        programId,
+        planId,
+        planRevision: id("r1"),
+        actionId,
+        eventKey,
+        nfTaskId: id(`nf-rsi-${ts}`),
+        runGeneration: 1,
+        claimFence: 0,
+      };
+      const descriptor = makeDescriptor(actionId);
+      const firstClaim = await store.claim(provisional, "owner-rsi-a", ts);
+      await store.beginExecution(firstClaim, descriptor);
+      const unknownReceipt = {
+        identity: firstClaim,
+        actionType: descriptor.actionType,
+        nfStatus: "UNKNOWN",
+        businessStatus: "UNKNOWN",
+        evidence: [],
+        recordedAt: ts,
+      };
+      await store.appendReceiptWithClaim(unknownReceipt, store, ts);
+      await store.release(firstClaim);
+      const recoveryClaim = await store.claim(provisional, "owner-rsi-b", ts + 1);
+      const staleReceipt = {
+        ...unknownReceipt,
+        identity: { ...recoveryClaim, planRevision: id("stale-revision") },
+        nfStatus: "DONE",
+        businessStatus: "COMPLETED",
+      };
+
+      await assert.rejects(
+        () => store.replaceReceiptWithClaim(firstClaim, staleReceipt, store, ts + 1),
+        StaleWriteError,
+        "replacement receipts must preserve the full stable execution identity",
+      );
+      const after = await store.findByEventKey(programId, planId, eventKey);
+      assert.equal(after?.receipt?.businessStatus, "UNKNOWN");
+      await store.release(recoveryClaim);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test(`[${label}] T2: duplicate outbox — repeated receipt write with same dedupe key is safe (idempotent)`, async () => {
     // This test verifies that a re-delivered dispatch (e.g. from an at-least-once
     // message bus) does not blow up. The store-level guard is the scoped idempotency
@@ -505,7 +619,7 @@ function runContractSuite(label, getStore) {
         },
       };
       const source = new InMemoryPlanSource(plan);
-      const core = new DpcCore({ plans: source, ledger: store, claims: store, nf: runtime, profile, clock: () => Date.now() });
+      const core = new DpcCore({ plans: source, store, nf: runtime, profile, clock: () => Date.now() });
 
       const req = { programId: plan.programId, planId: plan.planId, eventKey: id("od-event") };
 
@@ -532,7 +646,7 @@ function runContractSuite(label, getStore) {
 // ---------------------------------------------------------------------------
 // Run suite against InMemoryDurableStore
 // ---------------------------------------------------------------------------
-runContractSuite("InMemory", (_suffix) => makeStore("memory"));
+runContractSuite("InMemory", () => makeStore("memory"));
 
 // ---------------------------------------------------------------------------
 // InMemoryClaimAuthority.listExpiredClaims — the public seam used by
@@ -612,7 +726,20 @@ test("[InMemory] listExpiredClaims returns multiple expired claims, excludes act
 // Run suite against PostgresExecutionStore (skipped if no connection string)
 // ---------------------------------------------------------------------------
 if (connectionString) {
-  runContractSuite("PostgreSQL", (_suffix) => makeStore("postgres"));
+  runContractSuite("PostgreSQL", () => makeStore("postgres"));
+
+  test("[PostgreSQL] concurrent migrate calls are repeat-safe", async () => {
+    const firstPool = new Pool({ connectionString });
+    const secondPool = new Pool({ connectionString });
+    try {
+      await Promise.all([
+        new PostgresExecutionStore({ pool: firstPool }).migrate(),
+        new PostgresExecutionStore({ pool: secondPool }).migrate(),
+      ]);
+    } finally {
+      await Promise.all([firstPool.end(), secondPool.end()]);
+    }
+  });
 } else {
   test("[PostgreSQL] contract suite skipped — set DPC_POSTGRES_URL to enable", { skip: true }, () => {});
 }
