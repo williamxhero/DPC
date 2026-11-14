@@ -25,6 +25,7 @@ import {
   type OutboxEvent,
   StaleWriteError,
 } from "./types.js";
+import { sameExecutionIdentity, sameStableExecutionIdentity } from "./identity.js";
 
 export class InMemoryPlanSource implements PlanSource {
   public readCount = 0;
@@ -82,7 +83,7 @@ export class InMemoryActionLedger implements ActionLedger {
     if (record.receipt) {
       throw new StaleWriteError(`Receipt already exists: ${receipt.identity.eventKey}`);
     }
-    if (!this.matchesIdentity(record.identity, receipt.identity)) {
+    if (!sameExecutionIdentity(record.identity, receipt.identity)) {
       throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
     }
 
@@ -113,10 +114,10 @@ export class InMemoryActionLedger implements ActionLedger {
     if (!record || !record.receipt || record.receipt.businessStatus !== "UNKNOWN") {
       throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
     }
-    if (!this.matchesIdentity(record.identity, expectedIdentity)) {
+    if (!sameExecutionIdentity(record.identity, expectedIdentity)) {
       throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
     }
-    if (!this.matchesStableIdentity(record.identity, receipt.identity)) {
+    if (!sameStableExecutionIdentity(record.identity, receipt.identity)) {
       throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
     }
 
@@ -145,6 +146,19 @@ export class InMemoryActionLedger implements ActionLedger {
   public async findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined> {
     const records = this.recordsByAction.get(`${programId}:${planId}:${actionId}`);
     return records?.at(-1);
+  }
+
+  public async findLatestForActions(
+    programId: ProgramId,
+    planId: PlanId,
+    actionIds: readonly ActionId[],
+  ): Promise<ReadonlyMap<ActionId, ExecutionRecord>> {
+    const records = new Map<ActionId, ExecutionRecord>();
+    for (const actionId of new Set(actionIds)) {
+      const latest = await this.findLatestForAction(programId, planId, actionId);
+      if (latest) records.set(actionId, latest);
+    }
+    return records;
   }
 
   public async hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean> {
@@ -187,27 +201,6 @@ export class InMemoryActionLedger implements ActionLedger {
 
   private actionKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
-  }
-
-  private matchesStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration;
-  }
-
-  private matchesIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration
-      && left.claimFence === right.claimFence;
   }
 
   private lifecycleFor(receipt: Receipt): ExecutionRecord["lifecycle"] {
@@ -269,7 +262,7 @@ export class InMemoryClaimAuthority implements ClaimAuthority {
 
   public async assertValid(identity: ExecutionIdentity, now: number): Promise<void> {
     const current = this.claims.get(this.claimKey(identity));
-    if (!current || current.expiresAt <= now || !this.matchesIdentity(current.identity, identity)) {
+    if (!current || current.expiresAt <= now || !sameExecutionIdentity(current.identity, identity)) {
       throw new StaleWriteError(`Claim fence is stale for ${identity.actionId}`);
     }
   }
@@ -283,7 +276,7 @@ export class InMemoryClaimAuthority implements ClaimAuthority {
 
   public async release(identity: ExecutionIdentity): Promise<void> {
     const current = this.claims.get(this.claimKey(identity));
-    if (current && current.identity.claimFence === identity.claimFence) {
+    if (current && sameExecutionIdentity(current.identity, identity)) {
       this.claims.delete(this.claimKey(identity));
     }
   }
@@ -305,17 +298,6 @@ export class InMemoryClaimAuthority implements ClaimAuthority {
 
   private claimKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
-  }
-
-  private matchesIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration
-      && left.claimFence === right.claimFence;
   }
 }
 
@@ -399,7 +381,7 @@ export class InMemoryDurableStore implements DurableExecutionStore {
   }
 
   public async appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
-    if (!this.sameIdentity(lease.identity, receipt.identity)) {
+    if (!sameExecutionIdentity(lease.identity, receipt.identity)) {
       throw new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`);
     }
     await this.ledger.appendReceiptWithClaim(receipt, this.claims, now);
@@ -412,8 +394,8 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     receipt: Receipt,
     now: number,
   ): Promise<void> {
-    if (!this.sameStableIdentity(lease.identity, expectedIdentity)
-      || !this.sameIdentity(lease.identity, receipt.identity)) {
+    if (!sameStableExecutionIdentity(lease.identity, expectedIdentity)
+      || !sameExecutionIdentity(lease.identity, receipt.identity)) {
       throw new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`);
     }
     await this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, this.claims, now);
@@ -450,6 +432,14 @@ export class InMemoryDurableStore implements DurableExecutionStore {
 
   public findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined> {
     return this.ledger.findLatestForAction(programId, planId, actionId);
+  }
+
+  public findLatestForActions(
+    programId: ProgramId,
+    planId: PlanId,
+    actionIds: readonly ActionId[],
+  ): Promise<ReadonlyMap<ActionId, ExecutionRecord>> {
+    return this.ledger.findLatestForActions(programId, planId, actionIds);
   }
 
   public hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean> {
@@ -520,27 +510,6 @@ export class InMemoryDurableStore implements DurableExecutionStore {
       kind,
       observedAt,
     };
-  }
-
-  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration;
-  }
-
-  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration
-      && left.claimFence === right.claimFence;
   }
 
   private eventKey(identity: ExecutionIdentity): string {

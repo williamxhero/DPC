@@ -9,6 +9,7 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
+import { sameStableExecutionIdentity } from "../core/identity.js";
 
 interface LocalFileTarget {
   readonly relativePath: string;
@@ -244,13 +245,7 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
   }
 
   private sameMarker(marker: EffectMarker, identity: ExecutionIdentity, target: LocalFileTarget): boolean {
-    return marker.programId === identity.programId
-      && marker.planId === identity.planId
-      && marker.planRevision === identity.planRevision
-      && marker.actionId === identity.actionId
-      && marker.nfTaskId === identity.nfTaskId
-      && marker.eventKey === identity.eventKey
-      && marker.runGeneration === identity.runGeneration
+    return sameStableExecutionIdentity(marker, identity)
       && marker.relativePath === target.relativePath
       && marker.content === target.content;
   }

@@ -7,6 +7,7 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
+import { sameStableExecutionIdentity } from "../core/identity.js";
 
 interface CloudflareKvTarget {
   readonly key: string;
@@ -108,7 +109,7 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
     const target = this.targetFrom(action);
     const existing = await this.get(target.key);
     if (!existing) return;
-    if (!this.sameIdentity(existing, identity) || existing.value !== target.value) {
+    if (!sameStableExecutionIdentity(existing, identity) || existing.value !== target.value) {
       throw new Error(`Cloudflare KV cleanup refused an unowned key: ${target.key}`);
     }
     const response = await this.fetcher(this.url(target.key), {
@@ -187,18 +188,8 @@ export class CloudflareKvEffectRuntime implements NfActionRuntime, RecoveryAdapt
   }
 
   private sameValue(stored: StoredValue, request: NfExecutionRequest, target: CloudflareKvTarget): boolean {
-    return this.sameIdentity(stored, request.identity)
+    return sameStableExecutionIdentity(stored, request.identity)
       && stored.value === target.value;
-  }
-
-  private sameIdentity(stored: StoredValue, identity: ExecutionIdentity): boolean {
-    return stored.programId === identity.programId
-      && stored.planId === identity.planId
-      && stored.planRevision === identity.planRevision
-      && stored.actionId === identity.actionId
-      && stored.eventKey === identity.eventKey
-      && stored.nfTaskId === identity.nfTaskId
-      && stored.runGeneration === identity.runGeneration;
   }
 
   private isStoredValue(value: unknown): value is StoredValue {

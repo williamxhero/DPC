@@ -326,6 +326,130 @@ function runContractSuite(label, getStore) {
     }
   });
 
+  test(`[${label}] plan-scoped latest execution read returns one record per requested action`, async () => {
+    const { store, cleanup } = getStore("plan-scoped-read");
+    try {
+      await store.migrate();
+      const ts = Date.now();
+      const programId = id(`contract-prog-plan-read-${ts}-${label}`);
+      const planId = id("contract-plan-read");
+      const otherPlanId = id("contract-plan-read-other");
+      const actionA = id("action-plan-read-a");
+      const actionB = id("action-plan-read-b");
+      const actionC = id("action-plan-read-c");
+      const descriptorA = makeDescriptor(actionA);
+      const descriptorB = makeDescriptor(actionB);
+      const descriptorC = makeDescriptor(actionC);
+      const base = {
+        programId,
+        planRevision: id("r1"),
+        claimFence: 1,
+      };
+
+      await store.beginExecution({
+        ...base,
+        planId,
+        actionId: actionA,
+        eventKey: id("plan-read-a-first"),
+        nfTaskId: id("plan-read-task-a-first"),
+        runGeneration: 1,
+      }, descriptorA);
+      await store.beginExecution({
+        ...base,
+        planId,
+        actionId: actionA,
+        eventKey: id("plan-read-a-latest"),
+        nfTaskId: id("plan-read-task-a-latest"),
+        runGeneration: 2,
+      }, descriptorA);
+      await store.beginExecution({
+        ...base,
+        planId,
+        actionId: actionB,
+        eventKey: id("plan-read-b"),
+        nfTaskId: id("plan-read-task-b"),
+        runGeneration: 1,
+      }, descriptorB);
+      await store.beginExecution({
+        ...base,
+        planId: otherPlanId,
+        actionId: actionC,
+        eventKey: id("plan-read-other"),
+        nfTaskId: id("plan-read-task-other"),
+        runGeneration: 1,
+      }, descriptorC);
+
+      const empty = await store.findLatestForActions(programId, planId, []);
+      assert.equal(empty.size, 0);
+
+      const records = await store.findLatestForActions(programId, planId, [actionA, actionB, actionC]);
+      assert.equal(records.size, 2, "only records in the requested plan should be returned");
+      assert.equal(records.get(actionA)?.identity.eventKey, "plan-read-a-latest");
+      assert.equal(records.get(actionA)?.identity.runGeneration, 2);
+      assert.equal(records.get(actionB)?.identity.eventKey, "plan-read-b");
+      assert.equal(records.has(actionC), false, "an action from another plan must not leak into the result");
+
+      const otherRecords = await store.findLatestForActions(programId, otherPlanId, [actionC]);
+      assert.equal(otherRecords.size, 1);
+      assert.equal(otherRecords.get(actionC)?.identity.planId, otherPlanId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test(`[${label}] Core selection uses one plan-scoped read and preserves dependency gating`, async () => {
+    const { store, cleanup } = getStore("plan-selection-read");
+    try {
+      await store.migrate();
+      const plan = {
+        programId: id(`contract-prog-selection-${Date.now()}-${label}`),
+        planId: id("contract-plan-selection"),
+        revision: id("r1"),
+        profileInput: {},
+      };
+      const first = makeDescriptor("action-selection-first");
+      const second = makeDescriptor("action-selection-second", [first.actionId]);
+      const profile = new InMemoryProfile([first, second]);
+      const source = new InMemoryPlanSource(plan);
+      const runtime = {
+        execute: async (request) => ({ status: "DONE", evidence: [], identity: request.identity }),
+      };
+      const originalBatch = store.findLatestForActions.bind(store);
+      const originalSingle = store.findLatestForAction.bind(store);
+      const originalCompletion = store.hasBusinessCompletion.bind(store);
+      let batchCalls = 0;
+      let singleCalls = 0;
+      let completionCalls = 0;
+      store.findLatestForActions = (...args) => {
+        batchCalls += 1;
+        return originalBatch(...args);
+      };
+      store.findLatestForAction = (...args) => {
+        singleCalls += 1;
+        return originalSingle(...args);
+      };
+      store.hasBusinessCompletion = (...args) => {
+        completionCalls += 1;
+        return originalCompletion(...args);
+      };
+
+      const core = new DpcCore({ plans: source, store, nf: runtime, profile, clock: () => Date.now() });
+      const result = await core.dispatch({
+        programId: plan.programId,
+        planId: plan.planId,
+        eventKey: id("selection-event"),
+      });
+
+      assert.equal(result.status, "DISPATCHED");
+      assert.equal(result.nextAction?.actionId, second.actionId);
+      assert.equal(batchCalls, 2, "initial and post-receipt selection each read the plan once");
+      assert.equal(singleCalls, 1, "single-action read remains only for run-generation derivation");
+      assert.equal(completionCalls, 0, "dependency completion must use the prefetched map");
+    } finally {
+      await cleanup();
+    }
+  });
+
   // ---------------------------------------------------------------------------
   // T2: Atomic receipt lifecycle and transactional outbox
   // ---------------------------------------------------------------------------

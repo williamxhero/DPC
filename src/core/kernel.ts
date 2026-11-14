@@ -24,6 +24,7 @@ import {
   type RecoveryResult,
   StaleWriteError,
 } from "./types.js";
+import { sameExecutionIdentity, sameStableExecutionIdentity } from "./identity.js";
 
 const INITIAL_RUN_GENERATION = 1;
 const PROVISIONAL_CLAIM_FENCE = 0;
@@ -124,37 +125,29 @@ class LegacyExecutionStoreAdapter implements ExecutionStore {
     return this.ledger.hasBusinessCompletion(programId, planId, actionId);
   }
 
+  public async findLatestForActions(
+    programId: ExecutionIdentity["programId"],
+    planId: ExecutionIdentity["planId"],
+    actionIds: readonly ActionId[],
+  ): Promise<ReadonlyMap<ActionId, ExecutionRecord>> {
+    const records = new Map<ActionId, ExecutionRecord>();
+    for (const actionId of new Set(actionIds)) {
+      const record = await this.ledger.findLatestForAction(programId, planId, actionId);
+      if (record) records.set(actionId, record);
+    }
+    return records;
+  }
+
   private assertLeaseIdentity(lease: ExecutionLease, identity: ExecutionIdentity): void {
-    if (!this.sameIdentity(lease.identity, identity)) {
+    if (!sameExecutionIdentity(lease.identity, identity)) {
       throw new StaleWriteError(`Execution lease is stale: ${identity.eventKey}`);
     }
   }
 
   private assertLeaseStableIdentity(lease: ExecutionLease, identity: ExecutionIdentity): void {
-    if (!this.sameStableIdentity(lease.identity, identity)) {
+    if (!sameStableExecutionIdentity(lease.identity, identity)) {
       throw new StaleWriteError(`Execution lease is stale: ${identity.eventKey}`);
     }
-  }
-
-  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration;
-  }
-
-  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration
-      && left.claimFence === right.claimFence;
   }
 }
 
@@ -381,8 +374,13 @@ export class DpcCore {
     descriptors: readonly ActionDescriptor[],
     now: number,
   ): Promise<ActionDescriptor | undefined> {
+    const records = await this.executionStore.findLatestForActions(
+      plan.programId,
+      plan.planId,
+      descriptors.map(({ actionId }) => actionId),
+    );
     for (const action of descriptors) {
-      const record = await this.executionStore.findLatestForAction(plan.programId, plan.planId, action.actionId);
+      const record = records.get(action.actionId);
       if (record && this.isBlockedByRecord(record)) {
         continue;
       }
@@ -395,7 +393,7 @@ export class DpcCore {
 
       let dependenciesComplete = true;
       for (const dependency of action.dependencies) {
-        if (!(await this.executionStore.hasBusinessCompletion(plan.programId, plan.planId, dependency))) {
+        if (records.get(dependency)?.lifecycle !== "COMPLETED") {
           dependenciesComplete = false;
           break;
         }
@@ -487,7 +485,7 @@ export class DpcCore {
     if (!result.identity) {
       return;
     }
-    if (!this.sameIdentity(expected, result.identity)) {
+    if (!sameExecutionIdentity(expected, result.identity)) {
       throw new StaleWriteError(`NF result identity is stale for ${expected.actionId}`);
     }
   }
@@ -572,16 +570,5 @@ export class DpcCore {
       receipt: record.receipt,
       nextAction: await this.selectAction(plan, descriptors, now),
     };
-  }
-
-  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration
-      && left.claimFence === right.claimFence;
   }
 }

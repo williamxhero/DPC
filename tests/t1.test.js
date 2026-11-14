@@ -216,6 +216,27 @@ test("fencing allows one active owner and rejects the old fence", async () => {
   await claims.assertValid(second, 1000);
 });
 
+test("claim release requires the complete execution identity", async () => {
+  const claims = new InMemoryClaimAuthority(1000);
+  const identity = {
+    programId: id("program-1"),
+    planId: id("plan-1"),
+    planRevision: id("r1"),
+    actionId: id("action-1"),
+    eventKey: id("trigger-release"),
+    nfTaskId: id("nf:trigger-release:action-1"),
+    runGeneration: 1,
+    claimFence: 0,
+  };
+
+  const claimed = await claims.claim(identity, "owner-a", 1000);
+  await claims.release({ ...claimed, planRevision: id("r2") });
+  await claims.assertValid(claimed, 1000);
+
+  await claims.release(claimed);
+  await assert.rejects(() => claims.assertValid(claimed, 1000), StaleWriteError);
+});
+
 test("claim enforcement prevents concurrent events from executing one action twice", async () => {
   const action = descriptor("action-1");
   let releaseRuntime;

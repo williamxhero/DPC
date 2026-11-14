@@ -25,6 +25,7 @@ import {
   StaleWriteError,
 } from "../../core/types.js";
 import { INITIAL_SCHEMA_SQL } from "./schema.js";
+import { sameExecutionIdentity, sameStableExecutionIdentity } from "../../core/identity.js";
 
 export interface PostgresExecutionStoreConfig extends PoolConfig {
   readonly pool?: PgPool;
@@ -116,7 +117,7 @@ export class PostgresExecutionStore implements DurableExecutionStore {
   }
 
   public appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
-    if (!this.sameIdentity(lease.identity, receipt.identity)) {
+    if (!sameExecutionIdentity(lease.identity, receipt.identity)) {
       return Promise.reject(new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`));
     }
     return this.appendReceiptWithClaim(receipt, this, now);
@@ -128,8 +129,8 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     receipt: Receipt,
     now: number,
   ): Promise<void> {
-    if (!this.sameStableIdentity(lease.identity, expectedIdentity)
-      || !this.sameIdentity(lease.identity, receipt.identity)) {
+    if (!sameStableExecutionIdentity(lease.identity, expectedIdentity)
+      || !sameExecutionIdentity(lease.identity, receipt.identity)) {
       return Promise.reject(new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`));
     }
     return this.replaceReceiptWithClaim(expectedIdentity, receipt, this, now);
@@ -187,7 +188,7 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!execution || execution.receipt) {
         throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
       }
-      if (!this.sameStableIdentity(execution.identity, receipt.identity)) {
+      if (!sameStableExecutionIdentity(execution.identity, receipt.identity)) {
         throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
       }
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
@@ -212,10 +213,10 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!execution || !execution.receipt || execution.receipt.businessStatus !== "UNKNOWN") {
         throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
       }
-      if (!this.sameStableIdentity(execution.receipt.identity, expectedIdentity)) {
+      if (!sameStableExecutionIdentity(execution.receipt.identity, expectedIdentity)) {
         throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
       }
-      if (!this.sameStableIdentity(expectedIdentity, receipt.identity)) {
+      if (!sameStableExecutionIdentity(expectedIdentity, receipt.identity)) {
         throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
       }
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "RECOVERY_READBACK");
@@ -242,8 +243,29 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     return result.rows[0] ? this.mapExecution(result.rows[0]) : undefined;
   }
 
-  public async listReceipts(
+  public async findLatestForActions(
     programId: ProgramId,
+    planId: PlanId,
+    actionIds: readonly ActionId[],
+  ): Promise<ReadonlyMap<ActionId, ExecutionRecord>> {
+    const records = new Map<ActionId, ExecutionRecord>();
+    if (actionIds.length === 0) return records;
+
+    const result = await this.pool.query<ExecutionRow>(
+      `SELECT DISTINCT ON (e.action_id) e.*, r.receipt_json
+       FROM dpc_action_executions e
+       LEFT JOIN dpc_action_receipts r ON r.receipt_id = e.current_receipt_id
+       WHERE e.program_id = $1 AND e.plan_id = $2 AND e.action_id = ANY($3::text[])
+       ORDER BY e.action_id, e.run_generation DESC, e.created_at DESC`,
+      [programId, planId, [...actionIds]],
+    );
+    for (const row of result.rows) {
+      records.set(row.action_id as ActionId, this.mapExecution(row));
+    }
+    return records;
+  }
+
+  public async listReceipts(programId: ProgramId,
     planId: PlanId,
     eventKey: EventKey,
   ): Promise<readonly Receipt[]> {
@@ -591,20 +613,6 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       identity.eventKey,
       identity.runGeneration,
     ])).toString("base64url");
-  }
-
-  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration;
-  }
-
-  private sameIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return this.sameStableIdentity(left, right) && left.claimFence === right.claimFence;
   }
 
   private async transaction<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {

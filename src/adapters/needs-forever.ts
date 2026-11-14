@@ -11,6 +11,7 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
+import { sameStableExecutionIdentity } from "../core/identity.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -126,7 +127,7 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
     const target = this.targetFrom(request.action);
     const workspace = this.workspaceFor(request.identity);
     const marker = await this.readIdentity(workspace);
-    if (!marker || !this.sameStableIdentity(marker, request.identity)) return undefined;
+    if (!marker || !sameStableExecutionIdentity(marker, request.identity)) return undefined;
     const targetPath = this.safePath(workspace, target.relativePath);
     try {
       const actual = await readFile(targetPath, "utf8");
@@ -150,7 +151,7 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
     const workspace = this.workspaceFor(identity);
     const marker = await this.readIdentity(workspace);
     if (!marker) return;
-    if (!this.sameStableIdentity(marker, identity)) {
+    if (!sameStableExecutionIdentity(marker, identity)) {
       throw new Error(`Needs Forever cleanup refused an unowned workspace: ${workspace}`);
     }
     const statePath = path.join(workspace, "state.json");
@@ -240,16 +241,6 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
       if (this.errorCode(error) === "ENOENT") return undefined;
       throw error;
     }
-  }
-
-  private sameStableIdentity(left: ExecutionIdentity, right: ExecutionIdentity): boolean {
-    return left.programId === right.programId
-      && left.planId === right.planId
-      && left.planRevision === right.planRevision
-      && left.actionId === right.actionId
-      && left.eventKey === right.eventKey
-      && left.nfTaskId === right.nfTaskId
-      && left.runGeneration === right.runGeneration;
   }
 
   private workspaceFor(identity: ExecutionIdentity): string {

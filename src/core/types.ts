@@ -223,6 +223,15 @@ export interface ExecutionStore {
   findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined>;
   findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined>;
   hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean>;
+  /**
+   * Return the same latest-per-action view as findLatestForAction, but for one
+   * selection read. Missing actions are omitted from the returned map.
+   */
+  findLatestForActions(
+    programId: ProgramId,
+    planId: PlanId,
+    actionIds: readonly ActionId[],
+  ): Promise<ReadonlyMap<ActionId, ExecutionRecord>>;
 }
 
 export interface ReceiptHistoryReader {

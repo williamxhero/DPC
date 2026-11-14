@@ -17,7 +17,7 @@ T1 uses TypeScript compiled to Node.js ESM. The repository was greenfield, so th
 5. Interpret the NF result through the profile, write one `Receipt`, then read the plan again.
 6. Select and return the next eligible action from the current revision; it is not executed in the same call.
 
-The Core never constructs a production adapter and never exposes storage layout, lifecycle mutation, or profile-specific state to callers. The preferred durable dependency is `ExecutionStore`; the older `{ ledger, claims }` dependency form remains supported only as a compatibility path.
+The Core never constructs a production adapter and never exposes storage layout, lifecycle mutation, or profile-specific state to callers. The preferred durable dependency is `ExecutionStore`; the older `{ ledger, claims }` dependency form remains supported only as a compatibility path. Execution identity comparison rules are concentrated in the Core identity module, and action selection reads the latest execution state for the current descriptor set in one execution-store read.
 
 ## Contract and ordering
 
@@ -79,7 +79,7 @@ The live path starts the real NF worker/controller/judge control process, perfor
 
 ## Durable persistence
 
-The first durable persistence slice uses PostgreSQL as the single execution store. `PostgresExecutionStore` implements the Core-facing `ExecutionStore` plus the legacy action ledger and claim authority interfaces, so claim/fence validation, receipt append/replace, lifecycle update, outbox insertion and claim release can share one transaction. `PostgresWakeStore` and `PostgresHandoffStore` persist the existing WakeIntent and HandoffBundle seams, while `ReconciliationRunner` consumes only the narrow reconciliation-reader seam and exposes durable candidates without retrying an external side effect.
+The first durable persistence slice uses PostgreSQL as the single execution store. `PostgresExecutionStore` implements the Core-facing `ExecutionStore` plus the legacy action ledger and claim authority interfaces, so claim/fence validation, receipt append/replace, lifecycle update, outbox insertion and claim release can share one transaction. Its plan-scoped latest-execution read lets Core selection avoid per-action storage fan-out. `PostgresWakeStore` and `PostgresHandoffStore` persist the existing WakeIntent and HandoffBundle seams, while `ReconciliationRunner` consumes only the narrow reconciliation-reader seam and exposes durable candidates without retrying an external side effect.
 
 The schema includes executions, append-only receipts, claims, transactional outbox events, wake intents, handoff bundles, inbox dedupe and migration tracking. Event idempotency is scoped by `programId + planId + eventKey`; stale fences are rejected by conditional transaction checks. PostgreSQL remains an adapter behind the Core seam; GitHub remains plan authority.
 
@@ -114,7 +114,7 @@ An NF result of `UNKNOWN` is recorded as an unknown business receipt. `DpcCore.r
 
 ## Test surface
 
-Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current default local suite has 115 tests: 106 pass and nine opt-in PostgreSQL/live tests are skipped unless explicitly enabled; with `DPC_POSTGRES_URL` set, 166 tests run with 164 pass and two live tests skipped. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, lease-oriented receipt writes, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
+Tests exercise the public `DpcCore.dispatch` and scoped `recover` seams with in-memory, PostgreSQL and real-side-effect adapters. The current default local suite has 119 tests: 110 pass and nine opt-in PostgreSQL/live tests are skipped unless explicitly enabled; with `DPC_POSTGRES_URL` set, 172 tests run with 170 pass and two live tests skipped. Coverage includes normal sequential selection, dependency and time gates, post-action plan revision readback, scoped duplicate dispatch, separation of NF and business outcomes, observable adapter failure, single-owner fencing, stale identity rejection, lease-oriented receipt writes, plan-scoped latest execution reads, centralized full/stable identity rules, recovery-only unknown handling, wake lease reclamation, handoff identity isolation, adapter ownership checks, local reparse-point confinement, the real Needs Forever adapter seam, and PostgreSQL durable execution/wake/handoff contracts. Crash-window reconciliation remains a bounded first-version seam; production database operations remain future work.
 
 ## Commands
 
