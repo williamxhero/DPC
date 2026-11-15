@@ -95,30 +95,36 @@ export class InMemoryActionLedger implements ActionLedger {
   }
 
   public async appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void> {
-    await claims.assertValid(receipt.identity, now);
-    const eventKey = this.eventKey(receipt.identity);
-    const record = this.recordsByEvent.get(eventKey);
-    if (!record) {
-      throw new Error(`Execution has not been started: ${receipt.identity.eventKey}`);
+    const state = this.captureState();
+    try {
+      await claims.assertValid(receipt.identity, now);
+      const eventKey = this.eventKey(receipt.identity);
+      const record = this.recordsByEvent.get(eventKey);
+      if (!record) {
+        throw new Error(`Execution has not been started: ${receipt.identity.eventKey}`);
+      }
+      const transition = evaluateReceiptTransition({
+        kind: "FIRST_APPEND",
+        execution: record,
+        receipt,
+      });
+      const updated: ExecutionRecord = {
+        ...record,
+        lifecycle: transition.lifecycle,
+        receipt,
+      };
+      this.recordsByEvent.set(eventKey, updated);
+      const records = this.recordsByAction.get(this.actionKey(receipt.identity)) ?? [];
+      const index = records.findIndex((candidate) => candidate.identity.eventKey === receipt.identity.eventKey);
+      if (index >= 0) {
+        records[index] = updated;
+      }
+      this.receiptsByEvent.set(eventKey, [receipt]);
+      this.recordOutbox(receipt, "RECEIPT_RECORDED");
+    } catch (error) {
+      this.restoreState(state);
+      throw error;
     }
-    const transition = evaluateReceiptTransition({
-      kind: "FIRST_APPEND",
-      execution: record,
-      receipt,
-    });
-    const updated: ExecutionRecord = {
-      ...record,
-      lifecycle: transition.lifecycle,
-      receipt,
-    };
-    this.recordsByEvent.set(eventKey, updated);
-    const records = this.recordsByAction.get(this.actionKey(receipt.identity)) ?? [];
-    const index = records.findIndex((candidate) => candidate.identity.eventKey === receipt.identity.eventKey);
-    if (index >= 0) {
-      records[index] = updated;
-    }
-    this.receiptsByEvent.set(eventKey, [receipt]);
-    this.recordOutbox(receipt, "RECEIPT_RECORDED");
   }
 
   public async replaceReceiptWithClaim(
@@ -127,35 +133,41 @@ export class InMemoryActionLedger implements ActionLedger {
     claims: ClaimAuthority,
     now: number,
   ): Promise<void> {
-    await claims.assertValid(receipt.identity, now);
-    const eventKey = this.eventKey(expectedIdentity);
-    const record = this.recordsByEvent.get(eventKey);
-    if (!record) {
-      throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
-    }
-    const transition = evaluateReceiptTransition({
-      kind: "UNKNOWN_REPLACEMENT",
-      execution: record,
-      expectedIdentity,
-      receipt,
-    });
+    const state = this.captureState();
+    try {
+      await claims.assertValid(receipt.identity, now);
+      const eventKey = this.eventKey(expectedIdentity);
+      const record = this.recordsByEvent.get(eventKey);
+      if (!record) {
+        throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
+      }
+      const transition = evaluateReceiptTransition({
+        kind: "UNKNOWN_REPLACEMENT",
+        execution: record,
+        expectedIdentity,
+        receipt,
+      });
 
-    const updated: ExecutionRecord = {
-      ...record,
-      identity: receipt.identity,
-      lifecycle: transition.lifecycle,
-      receipt,
-    };
-    this.recordsByEvent.set(eventKey, updated);
-    const records = this.recordsByAction.get(this.actionKey(expectedIdentity)) ?? [];
-    const index = records.findIndex((candidate) => candidate.identity.eventKey === expectedIdentity.eventKey);
-    if (index >= 0) {
-      records[index] = updated;
+      const updated: ExecutionRecord = {
+        ...record,
+        identity: receipt.identity,
+        lifecycle: transition.lifecycle,
+        receipt,
+      };
+      this.recordsByEvent.set(eventKey, updated);
+      const records = this.recordsByAction.get(this.actionKey(expectedIdentity)) ?? [];
+      const index = records.findIndex((candidate) => candidate.identity.eventKey === expectedIdentity.eventKey);
+      if (index >= 0) {
+        records[index] = updated;
+      }
+      const receipts = this.receiptsByEvent.get(eventKey) ?? [];
+      receipts.push(receipt);
+      this.receiptsByEvent.set(eventKey, receipts);
+      this.recordOutbox(receipt, "RECOVERY_RESOLVED");
+    } catch (error) {
+      this.restoreState(state);
+      throw error;
     }
-    const receipts = this.receiptsByEvent.get(eventKey) ?? [];
-    receipts.push(receipt);
-    this.receiptsByEvent.set(eventKey, receipts);
-    this.recordOutbox(receipt, "RECOVERY_RESOLVED");
   }
 
   public async findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined> {
@@ -406,7 +418,12 @@ export class InMemoryDurableStore implements DurableExecutionStore {
   public readonly claims: InMemoryClaimAuthority;
   public readonly inbox: InMemoryInboxStore;
   private readonly clock: () => number;
-  private transitionTail: Promise<void> = Promise.resolve();
+  /**
+   * Serializes every store mutation that can overlap the semantic transition.
+   * Reads remain concurrent, and transition internals call component methods
+   * directly so they never enqueue a nested operation and deadlock.
+   */
+  private mutationTail: Promise<void> = Promise.resolve();
 
   public constructor(opts: {
     leaseDurationMs?: number;
@@ -423,21 +440,41 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     // In-memory store requires no schema setup.
   }
 
-  public async acquire(
+  private enqueueMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.mutationTail.then(operation);
+    this.mutationTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async withStateSnapshot<T>(operation: () => Promise<T>): Promise<T> {
+    const ledgerState = this.ledger.captureState();
+    const claimState = this.claims.captureState();
+    try {
+      return await operation();
+    } catch (error) {
+      this.ledger.restoreState(ledgerState);
+      this.claims.restoreState(claimState);
+      throw error;
+    }
+  }
+
+  public acquire(
     identity: ExecutionIdentity,
     ownerId: string,
     now: number,
   ): Promise<ExecutionLease> {
-    return { identity: await this.claims.claim(identity, ownerId, now) };
+    return this.enqueueMutation(async () => ({ identity: await this.claims.claim(identity, ownerId, now) }));
   }
 
   public startExecution(
     lease: ExecutionLease,
     action: ActionDescriptor,
   ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
-    return this.claims.withValidClaim(
-      lease.identity,
-      () => this.ledger.beginExecution(lease.identity, action),
+    return this.enqueueMutation(
+      () => this.claims.withValidClaim(
+        lease.identity,
+        () => this.ledger.beginExecution(lease.identity, action),
+      ),
     );
   }
 
@@ -446,15 +483,14 @@ export class InMemoryDurableStore implements DurableExecutionStore {
   }
 
   /**
-   * Atomically commits the external occurrence and the execution transition.
-   * The serialized tail models the row locks used by the PostgreSQL adapter;
+   * Atomically commits a newly received external occurrence and its first
+   * execution receipt. UNKNOWN readback replacement uses replaceUnknownReceipt.
+   * The serialized mutation tail models the row locks used by PostgreSQL;
    * state snapshots make failures observable as a full rollback rather than
    * relying on the absence of a database transaction.
    */
   public processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
-    const operation = this.transitionTail.then(() => this.processInboxOccurrenceNow(input));
-    this.transitionTail = operation.then(() => undefined, () => undefined);
-    return operation;
+    return this.enqueueMutation(() => this.processInboxOccurrenceNow(input));
   }
 
   private async processInboxOccurrenceNow(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
@@ -496,15 +532,17 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     }
   }
 
-  public async appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
+  public appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {
     if (!sameExecutionIdentity(lease.identity, receipt.identity)) {
-      throw new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`);
+      return Promise.reject(new StaleWriteError(`Receipt lease is stale: ${receipt.identity.eventKey}`));
     }
-    await this.ledger.appendReceiptWithClaim(receipt, this.claims, now);
-    await this.claims.release(receipt.identity);
+    return this.enqueueMutation(() => this.withStateSnapshot(async () => {
+      await this.ledger.appendReceiptWithClaim(receipt, this.claims, now);
+      await this.claims.release(receipt.identity);
+    }));
   }
 
-  public async replaceUnknownReceipt(
+  public replaceUnknownReceipt(
     lease: ExecutionLease,
     expectedIdentity: ExecutionIdentity,
     receipt: Receipt,
@@ -515,25 +553,27 @@ export class InMemoryDurableStore implements DurableExecutionStore {
       toStableExecutionIdentity(expectedIdentity),
     )
       || !sameExecutionIdentity(lease.identity, receipt.identity)) {
-      throw new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`);
+      return Promise.reject(new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`));
     }
-    await this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, this.claims, now);
-    await this.claims.release(receipt.identity);
+    return this.enqueueMutation(() => this.withStateSnapshot(async () => {
+      await this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, this.claims, now);
+      await this.claims.release(receipt.identity);
+    }));
   }
 
   public releaseExecution(lease: ExecutionLease): Promise<void> {
-    return this.claims.release(lease.identity);
+    return this.enqueueMutation(() => this.claims.release(lease.identity));
   }
 
   public beginExecution(
     identity: ExecutionIdentity,
     action: ActionDescriptor,
   ): Promise<{ readonly created: boolean; readonly record: ExecutionRecord }> {
-    return this.ledger.beginExecution(identity, action);
+    return this.enqueueMutation(() => this.ledger.beginExecution(identity, action));
   }
 
   public appendReceiptWithClaim(receipt: Receipt, claims: ClaimAuthority, now: number): Promise<void> {
-    return this.ledger.appendReceiptWithClaim(receipt, claims, now);
+    return this.enqueueMutation(() => this.ledger.appendReceiptWithClaim(receipt, claims, now));
   }
 
   public replaceReceiptWithClaim(
@@ -542,7 +582,7 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     claims: ClaimAuthority,
     now: number,
   ): Promise<void> {
-    return this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, claims, now);
+    return this.enqueueMutation(() => this.ledger.replaceReceiptWithClaim(expectedIdentity, receipt, claims, now));
   }
 
   public findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined> {
@@ -574,7 +614,7 @@ export class InMemoryDurableStore implements DurableExecutionStore {
   }
 
   public claim(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionIdentity> {
-    return this.claims.claim(identity, ownerId, now);
+    return this.enqueueMutation(() => this.claims.claim(identity, ownerId, now));
   }
 
   public assertValid(identity: ExecutionIdentity, now: number): Promise<void> {
@@ -586,7 +626,7 @@ export class InMemoryDurableStore implements DurableExecutionStore {
   }
 
   public release(identity: ExecutionIdentity): Promise<void> {
-    return this.claims.release(identity);
+    return this.enqueueMutation(() => this.claims.release(identity));
   }
 
   public async listReconciliationCandidates(now: number): Promise<readonly ReconciliationCandidate[]> {

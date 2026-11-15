@@ -304,6 +304,84 @@ function runContractSuite(implementation) {
     });
   }
 
+  if (implementation === "InMemory") {
+    test(`[${implementation}] ordinary receipt append rolls back ledger and claim release when outbox fails`, async () => {
+      const prepared = await prepare("append-rollback", implementation);
+      try {
+        injectFailure(prepared.store, implementation, "outbox");
+        await assert.rejects(
+          () => prepared.store.appendReceipt(prepared.lease, prepared.receipt, prepared.processedAt),
+          /injected/,
+        );
+        const record = await prepared.store.findByEventKey(
+          prepared.identity.programId,
+          prepared.identity.planId,
+          prepared.identity.eventKey,
+        );
+        assert.equal(record.receipt, undefined, "failed append must not leave a current receipt");
+        assert.equal((await prepared.store.listReceipts(
+          prepared.identity.programId,
+          prepared.identity.planId,
+          prepared.identity.eventKey,
+        )).length, 0);
+        assert.equal((await prepared.store.pendingOutbox())
+          .filter((event) => event.dedupeKey.includes(prepared.identity.eventKey)).length, 0);
+        await prepared.store.assertValid(prepared.lease.identity, prepared.processedAt);
+      } finally {
+        await prepared.cleanup();
+      }
+    });
+
+    test(`[${implementation}] ordinary UNKNOWN replacement rolls back ledger and claim release when outbox fails`, async () => {
+      const prepared = await prepare("replace-rollback", implementation);
+      try {
+        const unknownReceipt = {
+          ...prepared.receipt,
+          nfStatus: "UNKNOWN",
+          businessStatus: "UNKNOWN",
+        };
+        await prepared.store.appendReceipt(prepared.lease, unknownReceipt, prepared.processedAt);
+        const recoveryLease = await prepared.store.acquire(
+          prepared.identity,
+          "inbox-transition-recovery-owner",
+          prepared.processedAt,
+        );
+        const recoveryReceipt = {
+          ...unknownReceipt,
+          identity: recoveryLease.identity,
+          nfStatus: "DONE",
+          businessStatus: "COMPLETED",
+        };
+        injectFailure(prepared.store, implementation, "outbox");
+        await assert.rejects(
+          () => prepared.store.replaceUnknownReceipt(
+            recoveryLease,
+            prepared.lease.identity,
+            recoveryReceipt,
+            prepared.processedAt,
+          ),
+          /injected/,
+        );
+        const record = await prepared.store.findByEventKey(
+          prepared.identity.programId,
+          prepared.identity.planId,
+          prepared.identity.eventKey,
+        );
+        assert.equal(record.receipt.businessStatus, "UNKNOWN", "failed replacement must preserve the UNKNOWN pointer");
+        assert.equal((await prepared.store.listReceipts(
+          prepared.identity.programId,
+          prepared.identity.planId,
+          prepared.identity.eventKey,
+        )).length, 1, "failed replacement must not append history");
+        assert.equal((await prepared.store.pendingOutbox())
+          .filter((event) => event.dedupeKey.includes(prepared.identity.eventKey)).length, 1);
+        await prepared.store.assertValid(recoveryLease.identity, prepared.processedAt);
+      } finally {
+        await prepared.cleanup();
+      }
+    });
+  }
+
   test(`[${implementation}] stale lease cannot process a received occurrence`, async () => {
     const prepared = await prepare("stale", implementation);
     try {
@@ -329,30 +407,84 @@ function runContractSuite(implementation) {
     }
   });
 
-  if (implementation === "PostgreSQL") {
-    test(`[${implementation}] validates receipt lifecycle before marking inbox processed`, async () => {
-      const prepared = await prepare("ordering", implementation);
-      const order = [];
-      try {
-        const appendReceipt = prepared.store.appendReceiptInTransaction.bind(prepared.store);
-        const markInboxProcessed = prepared.store.markInboxProcessedInTransaction.bind(prepared.store);
-        prepared.store.appendReceiptInTransaction = async (...args) => {
-          order.push("receipt");
-          return appendReceipt(...args);
-        };
-        prepared.store.markInboxProcessedInTransaction = async (...args) => {
-          order.push("inbox");
-          return markInboxProcessed(...args);
-        };
+  test(`[${implementation}] rejects a receipt-state transition before processing the inbox`, async () => {
+    const prepared = await prepare("invalid-receipt-state", implementation);
+    try {
+      // Complete the execution through the public receipt seam first. A fresh
+      // lease keeps ownership valid while the existing receipt makes inbox
+      // processing an invalid FIRST_APPEND transition.
+      await prepared.store.appendReceipt(prepared.lease, prepared.receipt, prepared.processedAt);
+      const freshLease = await prepared.store.acquire(
+        prepared.identity,
+        "inbox-transition-retry-owner",
+        prepared.processedAt,
+      );
+      const invalidReceipt = { ...prepared.receipt, identity: freshLease.identity };
 
-        await prepared.store.processInboxOccurrence({
+      await assert.rejects(
+        () => prepared.store.processInboxOccurrence({
           provider: prepared.provider,
           externalEventId: prepared.externalEventId,
-          lease: prepared.lease,
-          receipt: prepared.receipt,
-          processedAt: prepared.processedAt,
+          lease: freshLease,
+          receipt: invalidReceipt,
+          processedAt: prepared.processedAt + 1,
+        }),
+        StaleWriteError,
+        "an existing receipt must reject the inbox transition",
+      );
+
+      const occurrence = await prepared.inbox.get(prepared.provider, prepared.externalEventId);
+      assert.equal(occurrence.status, "RECEIVED", "invalid lifecycle state must leave the inbox retryable");
+      const record = await prepared.store.findByEventKey(
+        prepared.identity.programId,
+        prepared.identity.planId,
+        prepared.identity.eventKey,
+      );
+      assert.equal(record.receipt.businessStatus, "COMPLETED");
+      assert.equal((await prepared.store.listReceipts(
+        prepared.identity.programId,
+        prepared.identity.planId,
+        prepared.identity.eventKey,
+      )).length, 1, "invalid processing must not append a second receipt");
+      assert.equal((await prepared.store.pendingOutbox())
+        .filter((event) => event.dedupeKey.includes(prepared.identity.eventKey)).length, 1);
+      await prepared.store.assertValid(freshLease.identity, prepared.processedAt);
+    } finally {
+      await prepared.cleanup();
+    }
+  });
+
+  if (implementation === "InMemory") {
+    test(`[${implementation}] failed transition cannot resurrect a concurrently released claim`, async () => {
+      const prepared = await prepare("claim-rollback-race", implementation);
+      try {
+        await prepared.store.appendReceipt(prepared.lease, prepared.receipt, prepared.processedAt);
+        const freshLease = await prepared.store.acquire(
+          prepared.identity,
+          "inbox-transition-race-owner",
+          prepared.processedAt,
+        );
+        const invalidReceipt = { ...prepared.receipt, identity: freshLease.identity };
+        const failed = prepared.store.processInboxOccurrence({
+          provider: prepared.provider,
+          externalEventId: prepared.externalEventId,
+          lease: freshLease,
+          receipt: invalidReceipt,
+          processedAt: prepared.processedAt + 1,
         });
-        assert.deepEqual(order, ["receipt", "inbox"]);
+
+        // Let the transition enter its async public reads before queuing a
+        // competing mutation. The release must run after rollback, not be
+        // overwritten by a stale snapshot.
+        await Promise.resolve();
+        const released = prepared.store.releaseExecution(freshLease);
+        await assert.rejects(() => failed, StaleWriteError);
+        await released;
+        await assert.rejects(
+          () => prepared.store.assertValid(freshLease.identity, prepared.processedAt),
+          StaleWriteError,
+          "a release concurrent with a failed transition must remain visible",
+        );
       } finally {
         await prepared.cleanup();
       }

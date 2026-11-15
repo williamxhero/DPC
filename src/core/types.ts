@@ -162,9 +162,15 @@ export interface ExecutionRecord {
 }
 
 /**
- * Semantic input for committing one received external occurrence with an
- * execution receipt. The caller supplies an owned lease, not a transaction
- * client; durable adapters own locking, CAS, rollback and claim release.
+ * Semantic input for committing one received external occurrence with its
+ * first execution receipt. The caller supplies an owned lease, not a
+ * transaction client; durable adapters own locking, CAS, rollback and claim
+ * release.
+ *
+ * This transition is intentionally for a newly received occurrence whose
+ * execution has no receipt yet. UNKNOWN readback recovery remains on the
+ * separate replaceUnknownReceipt seam so inbox processing never re-executes
+ * or replaces an uncertain external effect.
  */
 export interface InboxTransitionRequest {
   readonly provider: string;
@@ -180,8 +186,10 @@ export interface InboxTransitionResult {
 }
 
 /**
- * Durable execution capability for atomically processing an external inbox
- * occurrence and its corresponding execution transition.
+ * Durable execution capability for atomically processing one newly received
+ * external inbox occurrence with its first execution receipt and coordination
+ * side effects. UNKNOWN readback replacement remains on ExecutionStore's
+ * replaceUnknownReceipt seam.
  */
 export interface AtomicInboxTransitionStore {
   processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
@@ -228,10 +236,12 @@ export interface ClaimAuthority {
 }
 
 /**
- * Core-facing execution seam. The store owns the claim authority used by its
- * receipt writes; callers never provide a sibling ClaimAuthority instance.
+ * Core execution operations shared by legacy and durable stores.
+ *
+ * The atomic inbox capability is kept separate so legacy implementations can
+ * continue to omit it while durable stores advertise it as required.
  */
-export interface ExecutionStore {
+export interface ExecutionStoreCore {
   acquire(identity: ExecutionIdentity, ownerId: string, now: number): Promise<ExecutionLease>;
   startExecution(
     lease: ExecutionLease,
@@ -246,12 +256,6 @@ export interface ExecutionStore {
     now: number,
   ): Promise<void>;
   releaseExecution(lease: ExecutionLease): Promise<void>;
-  /**
-   * Optional capability for durable adapters. Legacy ExecutionStore
-   * implementations may omit it; DurableExecutionStore implementations expose
-   * the atomic transition without accepting a transaction client.
-   */
-  processInboxOccurrence?(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
   findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined>;
   findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined>;
   hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean>;
@@ -264,6 +268,20 @@ export interface ExecutionStore {
     planId: PlanId,
     actionIds: readonly ActionId[],
   ): Promise<ReadonlyMap<ActionId, ExecutionRecord>>;
+}
+
+/**
+ * Core-facing execution seam. The optional inbox method preserves source
+ * compatibility for legacy implementations that do not support atomic inbox
+ * processing; durable stores implement the required capability separately.
+ */
+export interface ExecutionStore extends ExecutionStoreCore {
+  /**
+   * Optional capability for durable adapters. Legacy ExecutionStore
+   * implementations may omit it; DurableExecutionStore implementations expose
+   * the atomic transition without accepting a transaction client.
+   */
+  processInboxOccurrence?(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
 }
 
 export interface ReceiptHistoryReader {
@@ -377,9 +395,10 @@ export interface ReconciliationCandidate {
  * fences, leases, transaction boundaries, inbox processing, outbox insertion
  * and reconciliation queries behind one durable Adapter.
  *
- * `processInboxOccurrence` atomically changes an existing RECEIVED occurrence
- * to PROCESSED together with its receipt, lifecycle/current pointer, outbox
- * event and owned claim release. Its transaction mechanics are adapter-owned.
+ * `processInboxOccurrence` atomically changes one newly received occurrence
+ * from RECEIVED to PROCESSED together with its first receipt,
+ * lifecycle/current pointer, outbox event and owned claim release. Its
+ * transaction mechanics are adapter-owned.
  *
  * ## Transaction semantics
  * `startExecution` is idempotent for the scoped execution identity. The
@@ -416,12 +435,7 @@ export interface ReconciliationCandidate {
  * Must be safe to call more than once (versioned, repeat-safe). Calling it on an
  * already-migrated schema MUST succeed without modifying existing data.
  */
-export interface DurableExecutionStore extends ActionLedger, ClaimAuthority, ExecutionStore, ReceiptHistoryReader, OutboxReader, ReconciliationReader {
-  /**
-   * Atomically process one existing RECEIVED inbox occurrence with its
-   * execution receipt and coordination side effects.
-   */
-  processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
+export interface DurableExecutionStore extends AtomicInboxTransitionStore, ActionLedger, ClaimAuthority, ExecutionStoreCore, ReceiptHistoryReader, OutboxReader, ReconciliationReader {
   /**
    * Apply (or verify) the versioned schema migration.
    * Safe to call on every startup — idempotent, never destructive.

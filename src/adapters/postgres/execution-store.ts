@@ -232,9 +232,11 @@ export class PostgresExecutionStore implements DurableExecutionStore {
   }
 
   /**
-   * Commit an external occurrence and its execution receipt as one durable
-   * transition. The transaction client, row locks and rollback remain private
-   * to this adapter; callers provide only semantic execution data.
+   * Commit a newly received external occurrence and its first execution receipt
+   * as one durable transition. UNKNOWN readback replacement remains on the
+   * separate replaceUnknownReceipt seam. The transaction client, row locks and
+   * rollback remain private to this adapter; callers provide only semantic
+   * execution data.
    */
   public processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
     if (!sameExecutionIdentity(input.lease.identity, input.receipt.identity)) {
