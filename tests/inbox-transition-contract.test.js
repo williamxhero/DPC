@@ -21,22 +21,52 @@ import { id, makeDescriptor } from "./helpers.js";
 const { Pool } = pg;
 const connectionString = process.env.DPC_POSTGRES_URL;
 
-function makeStore(implementation) {
+function makeStore(implementation, options = {}) {
   if (implementation === "InMemory") {
-    const store = new InMemoryDurableStore();
+    const store = new InMemoryDurableStore(options);
     return {
       store,
       inbox: store.inbox,
       cleanup: async () => {},
+      // In-memory state is intentionally retained for the shared semantic
+      // assertions; a fresh instance would not represent a restart.
+      restart: async () => ({
+        store,
+        inbox: store.inbox,
+        cleanup: async () => {},
+      }),
     };
   }
   const pool = new Pool({ connectionString });
-  const store = new PostgresExecutionStore({ pool });
+  const store = new PostgresExecutionStore({ ...options, pool });
+  const inbox = new PostgresInboxStore({ pool });
+  let closed = false;
+  const cleanup = async () => {
+    if (!closed) {
+      closed = true;
+      await pool.end();
+    }
+  };
   return {
     store,
-    inbox: new PostgresInboxStore({ pool }),
-    cleanup: async () => {
-      await pool.end();
+    inbox,
+    cleanup,
+    restart: async () => {
+      await cleanup();
+      const restartedPool = new Pool({ connectionString });
+      const restartedStore = new PostgresExecutionStore({ ...options, pool: restartedPool });
+      const restartedInbox = new PostgresInboxStore({ pool: restartedPool });
+      let restartedClosed = false;
+      return {
+        store: restartedStore,
+        inbox: restartedInbox,
+        cleanup: async () => {
+          if (!restartedClosed) {
+            restartedClosed = true;
+            await restartedPool.end();
+          }
+        },
+      };
     },
   };
 }
@@ -67,11 +97,15 @@ function makeContext(label) {
   };
 }
 
-async function prepare(label, implementation) {
+async function prepare(label, implementation, storeOptions = {}, acquireAt = undefined) {
   const context = makeContext(`${implementation}-${label}`);
-  const { store, inbox, cleanup } = makeStore(implementation);
+  const { store, inbox, cleanup, restart } = makeStore(implementation, storeOptions);
   await store.migrate();
-  const lease = await store.acquire(context.identity, "inbox-transition-owner", context.processedAt);
+  const lease = await store.acquire(
+    context.identity,
+    "inbox-transition-owner",
+    acquireAt ?? context.processedAt,
+  );
   await store.startExecution(lease, context.descriptor);
   await inbox.putOrIgnore(
     context.provider,
@@ -87,7 +121,7 @@ async function prepare(label, implementation) {
     evidence: [],
     recordedAt: context.processedAt,
   };
-  return { ...context, store, inbox, lease, receipt, cleanup };
+  return { ...context, store, inbox, lease, receipt, cleanup, restart };
 }
 
 function injectFailure(store, implementation, kind) {
@@ -167,6 +201,28 @@ function runContractSuite(implementation) {
         StaleWriteError,
         "successful transition must release the owned claim",
       );
+    } finally {
+      await prepared.cleanup();
+    }
+  });
+
+  test(`[${implementation}] lease validation uses adapter time rather than processedAt`, async () => {
+    // The receipt timestamp is deliberately far beyond the short lease. The
+    // adapter clock still owns the lease, so caller event metadata must not
+    // be used as the current time for ownership validation.
+    const prepared = await prepare("adapter-clock", implementation, {
+      clock: () => 0,
+      leaseDurationMs: 100,
+    }, 0);
+    try {
+      const result = await prepared.store.processInboxOccurrence({
+        provider: prepared.provider,
+        externalEventId: prepared.externalEventId,
+        lease: prepared.lease,
+        receipt: prepared.receipt,
+        processedAt: prepared.processedAt,
+      });
+      assert.equal(result.occurrence.status, "PROCESSED");
     } finally {
       await prepared.cleanup();
     }
@@ -273,6 +329,36 @@ function runContractSuite(implementation) {
     }
   });
 
+  if (implementation === "PostgreSQL") {
+    test(`[${implementation}] validates receipt lifecycle before marking inbox processed`, async () => {
+      const prepared = await prepare("ordering", implementation);
+      const order = [];
+      try {
+        const appendReceipt = prepared.store.appendReceiptInTransaction.bind(prepared.store);
+        const markInboxProcessed = prepared.store.markInboxProcessedInTransaction.bind(prepared.store);
+        prepared.store.appendReceiptInTransaction = async (...args) => {
+          order.push("receipt");
+          return appendReceipt(...args);
+        };
+        prepared.store.markInboxProcessedInTransaction = async (...args) => {
+          order.push("inbox");
+          return markInboxProcessed(...args);
+        };
+
+        await prepared.store.processInboxOccurrence({
+          provider: prepared.provider,
+          externalEventId: prepared.externalEventId,
+          lease: prepared.lease,
+          receipt: prepared.receipt,
+          processedAt: prepared.processedAt,
+        });
+        assert.deepEqual(order, ["receipt", "inbox"]);
+      } finally {
+        await prepared.cleanup();
+      }
+    });
+  }
+
   test(`[${implementation}] concurrent processing has exactly one committed result`, async () => {
     const prepared = await prepare("concurrent", implementation);
     try {
@@ -307,6 +393,7 @@ function runContractSuite(implementation) {
 
   test(`[${implementation}] committed transition is readable after adapter restart`, async () => {
     const prepared = await prepare("restart", implementation);
+    let restarted;
     try {
       await prepared.store.processInboxOccurrence({
         provider: prepared.provider,
@@ -315,17 +402,19 @@ function runContractSuite(implementation) {
         receipt: prepared.receipt,
         processedAt: prepared.processedAt,
       });
-      const reloaded = await prepared.inbox.get(prepared.provider, prepared.externalEventId);
+      restarted = await prepared.restart();
+      const reloaded = await restarted.inbox.get(prepared.provider, prepared.externalEventId);
       assert.equal(reloaded.status, "PROCESSED");
-      const execution = await prepared.store.findByEventKey(
+      const execution = await restarted.store.findByEventKey(
         prepared.identity.programId,
         prepared.identity.planId,
         prepared.identity.eventKey,
       );
       assert.equal(execution.receipt.businessStatus, "COMPLETED");
-      assert.equal((await prepared.store.pendingOutbox())
+      assert.equal((await restarted.store.pendingOutbox())
         .filter((event) => event.dedupeKey.includes(prepared.identity.eventKey)).length, 1);
     } finally {
+      await restarted?.cleanup();
       await prepared.cleanup();
     }
   });

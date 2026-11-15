@@ -472,7 +472,7 @@ export class InMemoryDurableStore implements DurableExecutionStore {
         );
       }
       await this.claims.assertValid(input.lease.identity, this.clock());
-      await this.ledger.appendReceiptWithClaim(input.receipt, this.claims, input.processedAt);
+      await this.ledger.appendReceiptWithClaim(input.receipt, this.claims, this.clock());
       const processed = await this.inbox.markProcessed(
         input.provider,
         input.externalEventId,

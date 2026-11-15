@@ -242,13 +242,13 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     }
     return this.transaction(async (client) => {
       await this.lockClaim(client, input.lease.identity, this.clock());
+      const execution = await this.appendReceiptInTransaction(client, input.receipt);
       const occurrence = await this.markInboxProcessedInTransaction(
         client,
         input.provider,
         input.externalEventId,
         input.processedAt,
       );
-      const execution = await this.appendReceiptInTransaction(client, input.receipt);
       await this.deleteClaim(client, input.receipt.identity);
       return { occurrence, record: execution };
     });
