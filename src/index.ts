@@ -1,4 +1,6 @@
 export { DpcCore } from "./core/kernel.js";
+export { sameExecutionIdentity, sameStableExecutionIdentity, toStableExecutionIdentity } from "./core/identity.js";
+export type { StableExecutionIdentity } from "./core/identity.js";
 export { assessTacticalRoute, createAdvisoryPlanChange, revisionCanAffectAction } from "./core/revision.js";
 export { CloudflareKvEffectRuntime } from "./adapters/cloudflare-kv.js";
 export { WranglerKvEffectRuntime } from "./adapters/wrangler-kv.js";

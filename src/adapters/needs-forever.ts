@@ -11,7 +11,12 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
-import { sameStableExecutionIdentity } from "../core/identity.js";
+import {
+  readStableExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+  type StableExecutionIdentity,
+} from "../core/identity.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,7 +132,7 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
     const target = this.targetFrom(request.action);
     const workspace = this.workspaceFor(request.identity);
     const marker = await this.readIdentity(workspace);
-    if (!marker || !sameStableExecutionIdentity(marker, request.identity)) return undefined;
+    if (!marker || !sameStableExecutionIdentity(marker, toStableExecutionIdentity(request.identity))) return undefined;
     const targetPath = this.safePath(workspace, target.relativePath);
     try {
       const actual = await readFile(targetPath, "utf8");
@@ -151,7 +156,7 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
     const workspace = this.workspaceFor(identity);
     const marker = await this.readIdentity(workspace);
     if (!marker) return;
-    if (!sameStableExecutionIdentity(marker, identity)) {
+    if (!sameStableExecutionIdentity(marker, toStableExecutionIdentity(identity))) {
       throw new Error(`Needs Forever cleanup refused an unowned workspace: ${workspace}`);
     }
     const statePath = path.join(workspace, "state.json");
@@ -223,20 +228,10 @@ export class NeedsForeverLocalFileRuntime implements NfActionRuntime, RecoveryAd
     return parsed as ControlStatus;
   }
 
-  private async readIdentity(workspace: string): Promise<ExecutionIdentity | undefined> {
+  private async readIdentity(workspace: string): Promise<StableExecutionIdentity | undefined> {
     try {
       const parsed: unknown = JSON.parse(await readFile(path.join(workspace, "identity.json"), "utf8"));
-      if (!parsed || typeof parsed !== "object") return undefined;
-      const candidate = parsed as Record<string, unknown>;
-      if (typeof candidate.programId !== "string"
-        || typeof candidate.planId !== "string"
-        || typeof candidate.planRevision !== "string"
-        || typeof candidate.actionId !== "string"
-        || typeof candidate.eventKey !== "string"
-        || typeof candidate.nfTaskId !== "string"
-        || typeof candidate.runGeneration !== "number"
-        || typeof candidate.claimFence !== "number") return undefined;
-      return candidate as unknown as ExecutionIdentity;
+      return readStableExecutionIdentity(parsed);
     } catch (error) {
       if (this.errorCode(error) === "ENOENT") return undefined;
       throw error;

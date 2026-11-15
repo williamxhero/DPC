@@ -9,7 +9,11 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
-import { sameStableExecutionIdentity } from "../core/identity.js";
+import {
+  readStableExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+} from "../core/identity.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -76,13 +80,7 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
       target.key,
       this.encode({
         dpcVersion: 1,
-        programId: request.identity.programId,
-        planId: request.identity.planId,
-        planRevision: request.identity.planRevision,
-        actionId: request.identity.actionId,
-        eventKey: request.identity.eventKey,
-        nfTaskId: request.identity.nfTaskId,
-        runGeneration: request.identity.runGeneration,
+        ...toStableExecutionIdentity(request.identity),
         value: target.value,
       }),
       "--namespace-id",
@@ -103,7 +101,7 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
     const target = this.targetFrom(action);
     const existing = await this.get(target.key);
     if (!existing) return;
-    if (!sameStableExecutionIdentity(existing, identity) || existing.value !== target.value) {
+    if (!this.sameStableIdentity(existing, identity) || existing.value !== target.value) {
       throw new Error(`Cloudflare KV cleanup refused an unowned key: ${target.key}`);
     }
     try {
@@ -185,7 +183,13 @@ export class WranglerKvEffectRuntime implements NfActionRuntime, RecoveryAdapter
   }
 
   private sameValue(stored: StoredValue, request: NfExecutionRequest, target: WranglerKvTarget): boolean {
-    return sameStableExecutionIdentity(stored, request.identity) && stored.value === target.value;
+    return this.sameStableIdentity(stored, request.identity) && stored.value === target.value;
+  }
+
+  private sameStableIdentity(stored: StoredValue, identity: ExecutionIdentity): boolean {
+    const storedIdentity = readStableExecutionIdentity(stored);
+    return storedIdentity !== undefined
+      && sameStableExecutionIdentity(storedIdentity, toStableExecutionIdentity(identity));
   }
 
   private isStoredValue(value: unknown): value is StoredValue {

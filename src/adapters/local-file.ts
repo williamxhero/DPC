@@ -9,7 +9,11 @@ import type {
   NfExecutionResult,
   RecoveryAdapter,
 } from "../core/types.js";
-import { sameStableExecutionIdentity } from "../core/identity.js";
+import {
+  readStableExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+} from "../core/identity.js";
 
 interface LocalFileTarget {
   readonly relativePath: string;
@@ -89,13 +93,7 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
     await mkdir(this.markerDir, { recursive: true });
     await this.assertNoReparsePoints(this.markerDir);
     const marker: EffectMarker = {
-      programId: request.identity.programId,
-      planId: request.identity.planId,
-      planRevision: request.identity.planRevision,
-      actionId: request.identity.actionId,
-      nfTaskId: request.identity.nfTaskId,
-      eventKey: request.identity.eventKey,
-      runGeneration: request.identity.runGeneration,
+      ...toStableExecutionIdentity(request.identity),
       relativePath: target.relativePath,
       content: target.content,
     };
@@ -245,7 +243,9 @@ export class LocalFileEffectRuntime implements NfActionRuntime, RecoveryAdapter 
   }
 
   private sameMarker(marker: EffectMarker, identity: ExecutionIdentity, target: LocalFileTarget): boolean {
-    return sameStableExecutionIdentity(marker, identity)
+    const markerIdentity = readStableExecutionIdentity(marker);
+    return markerIdentity !== undefined
+      && sameStableExecutionIdentity(markerIdentity, toStableExecutionIdentity(identity))
       && marker.relativePath === target.relativePath
       && marker.content === target.content;
   }
