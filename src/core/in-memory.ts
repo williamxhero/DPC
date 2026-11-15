@@ -30,6 +30,7 @@ import {
   sameStableExecutionIdentity,
   toStableExecutionIdentity,
 } from "./identity.js";
+import { evaluateReceiptTransition } from "./lifecycle.js";
 
 export class InMemoryPlanSource implements PlanSource {
   public readCount = 0;
@@ -84,16 +85,14 @@ export class InMemoryActionLedger implements ActionLedger {
     if (!record) {
       throw new Error(`Execution has not been started: ${receipt.identity.eventKey}`);
     }
-    if (record.receipt) {
-      throw new StaleWriteError(`Receipt already exists: ${receipt.identity.eventKey}`);
-    }
-    if (!sameExecutionIdentity(record.identity, receipt.identity)) {
-      throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
-    }
-
+    const transition = evaluateReceiptTransition({
+      kind: "FIRST_APPEND",
+      execution: record,
+      receipt,
+    });
     const updated: ExecutionRecord = {
       ...record,
-      lifecycle: this.lifecycleFor(receipt),
+      lifecycle: transition.lifecycle,
       receipt,
     };
     this.recordsByEvent.set(eventKey, updated);
@@ -115,23 +114,20 @@ export class InMemoryActionLedger implements ActionLedger {
     await claims.assertValid(receipt.identity, now);
     const eventKey = this.eventKey(expectedIdentity);
     const record = this.recordsByEvent.get(eventKey);
-    if (!record || !record.receipt || record.receipt.businessStatus !== "UNKNOWN") {
+    if (!record) {
       throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
     }
-    if (!sameExecutionIdentity(record.identity, expectedIdentity)) {
-      throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
-    }
-    if (!sameStableExecutionIdentity(
-      toStableExecutionIdentity(record.identity),
-      toStableExecutionIdentity(receipt.identity),
-    )) {
-      throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
-    }
+    const transition = evaluateReceiptTransition({
+      kind: "UNKNOWN_REPLACEMENT",
+      execution: record,
+      expectedIdentity,
+      receipt,
+    });
 
     const updated: ExecutionRecord = {
       ...record,
       identity: receipt.identity,
-      lifecycle: this.lifecycleFor(receipt),
+      lifecycle: transition.lifecycle,
       receipt,
     };
     this.recordsByEvent.set(eventKey, updated);
@@ -210,20 +206,6 @@ export class InMemoryActionLedger implements ActionLedger {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
   }
 
-  private lifecycleFor(receipt: Receipt): ExecutionRecord["lifecycle"] {
-    switch (receipt.businessStatus) {
-      case "COMPLETED":
-        return "COMPLETED";
-      case "WAIT_EXTERNAL":
-        return "WAITING";
-      case "FAILED":
-        return "FAILED";
-      case "UNKNOWN":
-        return "UNKNOWN";
-      case "CONTINUE":
-        return "STARTED";
-    }
-  }
 }
 
 export class NoopClaimAuthority implements ClaimAuthority {

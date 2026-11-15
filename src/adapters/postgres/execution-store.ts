@@ -30,6 +30,7 @@ import {
   sameStableExecutionIdentity,
   toStableExecutionIdentity,
 } from "../../core/identity.js";
+import { evaluateReceiptTransition } from "../../core/lifecycle.js";
 
 export interface PostgresExecutionStoreConfig extends PoolConfig {
   readonly pool?: PgPool;
@@ -192,17 +193,16 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     await this.transaction(async (client) => {
       await this.lockClaim(client, receipt.identity, now);
       const execution = await this.findExecution(client, receipt.identity.programId, receipt.identity.planId, receipt.identity.eventKey, true);
-      if (!execution || execution.receipt) {
+      if (!execution) {
         throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
       }
-      if (!sameStableExecutionIdentity(
-        toStableExecutionIdentity(execution.identity),
-        toStableExecutionIdentity(receipt.identity),
-      )) {
-        throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
-      }
+      const transition = evaluateReceiptTransition({
+        kind: "FIRST_APPEND",
+        execution,
+        receipt,
+      });
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
-      await this.updateExecution(client, execution.execution_id, receipt, receiptId);
+      await this.updateExecution(client, execution.execution_id, receipt, receiptId, transition.lifecycle);
       await this.insertOutbox(client, `receipt:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECEIPT_RECORDED", execution.execution_id, receipt);
       await this.deleteClaim(client, receipt.identity);
     });
@@ -220,23 +220,17 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     await this.transaction(async (client) => {
       await this.lockClaim(client, receipt.identity, now);
       const execution = await this.findExecution(client, expectedIdentity.programId, expectedIdentity.planId, expectedIdentity.eventKey, true);
-      if (!execution || !execution.receipt || execution.receipt.businessStatus !== "UNKNOWN") {
+      if (!execution) {
         throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
       }
-      if (!sameStableExecutionIdentity(
-        toStableExecutionIdentity(execution.receipt.identity),
-        toStableExecutionIdentity(expectedIdentity),
-      )) {
-        throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
-      }
-      if (!sameStableExecutionIdentity(
-        toStableExecutionIdentity(expectedIdentity),
-        toStableExecutionIdentity(receipt.identity),
-      )) {
-        throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
-      }
+      const transition = evaluateReceiptTransition({
+        kind: "UNKNOWN_REPLACEMENT",
+        execution,
+        expectedIdentity,
+        receipt,
+      });
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "RECOVERY_READBACK");
-      await this.updateExecution(client, execution.execution_id, receipt, receiptId);
+      await this.updateExecution(client, execution.execution_id, receipt, receiptId, transition.lifecycle);
       await this.insertOutbox(client, `recovery:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECOVERY_RESOLVED", execution.execution_id, receipt);
       await this.deleteClaim(client, receipt.identity);
     });
@@ -553,6 +547,7 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     executionId: string,
     receipt: Receipt,
     receiptId: string,
+    lifecycle: ExecutionRecord["lifecycle"],
   ): Promise<void> {
     await client.query(
       `UPDATE dpc_action_executions
@@ -561,7 +556,7 @@ export class PostgresExecutionStore implements DurableExecutionStore {
            current_receipt_id = $4,
            updated_at = now()
        WHERE execution_id = $1`,
-      [executionId, this.lifecycleFor(receipt), receipt.identity.claimFence, receiptId],
+      [executionId, lifecycle, receipt.identity.claimFence, receiptId],
     );
   }
 
@@ -610,16 +605,6 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       lifecycle: row.lifecycle,
       receipt: row.receipt_json ?? undefined,
     };
-  }
-
-  private lifecycleFor(receipt: Receipt): ExecutionRecord["lifecycle"] {
-    switch (receipt.businessStatus) {
-      case "COMPLETED": return "COMPLETED";
-      case "WAIT_EXTERNAL": return "WAITING";
-      case "FAILED": return "FAILED";
-      case "UNKNOWN": return "UNKNOWN";
-      case "CONTINUE": return "STARTED";
-    }
   }
 
   private executionId(identity: ExecutionIdentity): string {
