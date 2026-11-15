@@ -134,6 +134,16 @@ test("receipt lifecycle rejects non-UNKNOWN, duplicate, and stale replacements",
     () => evaluateReceiptTransition({
       kind: "UNKNOWN_REPLACEMENT",
       execution: unknownExecution,
+      expectedIdentity: { ...identity, claimFence: identity.claimFence + 1 },
+      receipt: receipt({ identity: { ...identity, claimFence: 9 }, businessStatus: "COMPLETED" }),
+    }),
+    StaleWriteError,
+  );
+
+  assert.throws(
+    () => evaluateReceiptTransition({
+      kind: "UNKNOWN_REPLACEMENT",
+      execution: unknownExecution,
       expectedIdentity: identity,
       receipt: receipt({ identity: { ...identity, actionId: "other-action", claimFence: 9 } }),
     }),

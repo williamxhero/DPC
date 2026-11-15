@@ -70,10 +70,7 @@ export function evaluateReceiptTransition(
     throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity?.eventKey ?? request.receipt.identity.eventKey}`);
   }
 
-  if (!sameStableExecutionIdentity(
-    toStableExecutionIdentity(request.execution.identity),
-    toStableExecutionIdentity(expectedIdentity),
-  )) {
+  if (!sameExecutionIdentity(request.execution.identity, expectedIdentity)) {
     throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
   }
   if (!sameStableExecutionIdentity(
