@@ -24,7 +24,11 @@ import {
   type RecoveryResult,
   StaleWriteError,
 } from "./types.js";
-import { sameExecutionIdentity, sameStableExecutionIdentity } from "./identity.js";
+import {
+  sameExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+} from "./identity.js";
 
 const INITIAL_RUN_GENERATION = 1;
 const PROVISIONAL_CLAIM_FENCE = 0;
@@ -145,7 +149,10 @@ class LegacyExecutionStoreAdapter implements ExecutionStore {
   }
 
   private assertLeaseStableIdentity(lease: ExecutionLease, identity: ExecutionIdentity): void {
-    if (!sameStableExecutionIdentity(lease.identity, identity)) {
+    if (!sameStableExecutionIdentity(
+      toStableExecutionIdentity(lease.identity),
+      toStableExecutionIdentity(identity),
+    )) {
       throw new StaleWriteError(`Execution lease is stale: ${identity.eventKey}`);
     }
   }

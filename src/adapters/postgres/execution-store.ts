@@ -25,7 +25,11 @@ import {
   StaleWriteError,
 } from "../../core/types.js";
 import { INITIAL_SCHEMA_SQL } from "./schema.js";
-import { sameExecutionIdentity, sameStableExecutionIdentity } from "../../core/identity.js";
+import {
+  sameExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+} from "../../core/identity.js";
 
 export interface PostgresExecutionStoreConfig extends PoolConfig {
   readonly pool?: PgPool;
@@ -129,7 +133,10 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     receipt: Receipt,
     now: number,
   ): Promise<void> {
-    if (!sameStableExecutionIdentity(lease.identity, expectedIdentity)
+    if (!sameStableExecutionIdentity(
+      toStableExecutionIdentity(lease.identity),
+      toStableExecutionIdentity(expectedIdentity),
+    )
       || !sameExecutionIdentity(lease.identity, receipt.identity)) {
       return Promise.reject(new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`));
     }
@@ -188,7 +195,10 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!execution || execution.receipt) {
         throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
       }
-      if (!sameStableExecutionIdentity(execution.identity, receipt.identity)) {
+      if (!sameStableExecutionIdentity(
+        toStableExecutionIdentity(execution.identity),
+        toStableExecutionIdentity(receipt.identity),
+      )) {
         throw new StaleWriteError(`Receipt identity is stale: ${receipt.identity.eventKey}`);
       }
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
@@ -213,10 +223,16 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       if (!execution || !execution.receipt || execution.receipt.businessStatus !== "UNKNOWN") {
         throw new StaleWriteError(`Execution is not recoverable: ${expectedIdentity.eventKey}`);
       }
-      if (!sameStableExecutionIdentity(execution.receipt.identity, expectedIdentity)) {
+      if (!sameStableExecutionIdentity(
+        toStableExecutionIdentity(execution.receipt.identity),
+        toStableExecutionIdentity(expectedIdentity),
+      )) {
         throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
       }
-      if (!sameStableExecutionIdentity(expectedIdentity, receipt.identity)) {
+      if (!sameStableExecutionIdentity(
+        toStableExecutionIdentity(expectedIdentity),
+        toStableExecutionIdentity(receipt.identity),
+      )) {
         throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
       }
       const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "RECOVERY_READBACK");

@@ -25,7 +25,11 @@ import {
   type OutboxEvent,
   StaleWriteError,
 } from "./types.js";
-import { sameExecutionIdentity, sameStableExecutionIdentity } from "./identity.js";
+import {
+  sameExecutionIdentity,
+  sameStableExecutionIdentity,
+  toStableExecutionIdentity,
+} from "./identity.js";
 
 export class InMemoryPlanSource implements PlanSource {
   public readCount = 0;
@@ -117,7 +121,10 @@ export class InMemoryActionLedger implements ActionLedger {
     if (!sameExecutionIdentity(record.identity, expectedIdentity)) {
       throw new StaleWriteError(`Recovery identity is stale: ${expectedIdentity.eventKey}`);
     }
-    if (!sameStableExecutionIdentity(record.identity, receipt.identity)) {
+    if (!sameStableExecutionIdentity(
+      toStableExecutionIdentity(record.identity),
+      toStableExecutionIdentity(receipt.identity),
+    )) {
       throw new StaleWriteError(`Recovery receipt identity is stale: ${expectedIdentity.eventKey}`);
     }
 
@@ -394,7 +401,10 @@ export class InMemoryDurableStore implements DurableExecutionStore {
     receipt: Receipt,
     now: number,
   ): Promise<void> {
-    if (!sameStableExecutionIdentity(lease.identity, expectedIdentity)
+    if (!sameStableExecutionIdentity(
+      toStableExecutionIdentity(lease.identity),
+      toStableExecutionIdentity(expectedIdentity),
+    )
       || !sameExecutionIdentity(lease.identity, receipt.identity)) {
       throw new StaleWriteError(`Recovery lease is stale: ${expectedIdentity.eventKey}`);
     }
