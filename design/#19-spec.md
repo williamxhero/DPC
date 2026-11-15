@@ -4,7 +4,7 @@
 
 - 类型：architecture deepening follow-up SPEC；候选 1、2、4 作为一个组合交付规划，作为三个相互独立但可组合的 deep module 实现。
 - 来源：Issue #18 完成后的 architecture review。
-- 状态：`to-spec`；本次只完成 SPEC 与 issue 发布，不开始实现。
+- 状态：`implemented-on-integration`；三个 deep module 已实现并完成组合验证，待 Issue 收尾、合入 `master` 和远端同步。
 - 主题：深化 execution identity、receipt lifecycle，以及 inbox/receipt/outbox 原子 transition。
 - 前置成果：Issue #10 durable persistence、Issue #17 ExecutionStore lease seam、Issue #18 execution identity comparison 与 plan-scoped selection read 已合入 `master`。
 - 组合交付顺序：execution identity → receipt lifecycle → atomic inbox transition。
@@ -169,12 +169,23 @@ DPC 当前已经具备 durable execution、claim fencing、append-only receipts�
 - Making inbox payloads authoritative business facts without a successful atomic transition.
 - Requiring all inbox consumers to migrate in a flag day; compatibility adapters may remain while the new semantic seam is adopted.
 - Modifying another repository or production infrastructure.
-- Implementing the feature in this SPEC-only phase.
+- Implementing unrelated features outside the three deep modules and their compatibility-preserving integration.
+
+## Verification Evidence
+
+- `npm run check`: passed (`tsc -p tsconfig.json`).
+- `npm test` without PostgreSQL: passed — 141 tests, 131 passed, 10 skipped, 0 failed.
+- PostgreSQL-backed `npm test`: passed — 203 tests, 201 passed, 2 skipped, 0 failed; the skipped tests are opt-in live Cloudflare/Needs Forever acceptance tests.
+- `DPC_POSTGRES_URL=postgres://postgres:dpc_test@127.0.0.1:55434/dpc_test npm run test:postgres`: passed — 2 tests, 2 passed, 0 skipped, 0 failed.
+- `git diff --check`: passed.
+- Code review was completed against `3d04e22`; identified transition-order, adapter-clock, restart-readback, public-test-seam, InMemory rollback/concurrency, and capability-shape findings were fixed before final verification.
+- PostgreSQL verification used a disposable local `postgres:16` container; it was removed after testing and no schema migration was introduced.
+- Integration branch commits: `d449dfd`, `7bbe744`, `f513b62`, `256dcea`, `7add38f`, `2627bfa`, `f01ef9b`, `56577af`.
 
 ## Further Notes
 
 - The three candidates are related by execution transition but are not alternatives. Identity is the foundational invariant; lifecycle is the state-policy module; atomic inbox transition is the persistence orchestration module.
-- The implementation should use the deletion test at each step: deleting identity should recreate field comparisons across many callers; deleting lifecycle should recreate status and transition rules in Core and adapters; deleting atomic transition should force callers to manage database transaction composition.
-- ADR-002 is reinforced by the identity distinction and by keeping the Core-facing execution seam small. ADR-001 is intentionally revisited only at the inbox transaction-client seam: the current structural transaction client was a valid first slice, but this SPEC proposes hiding it if the combined transition can preserve the same atomic guarantees.
-- The issue is ready for agent work after this SPEC is published, but the current user instruction is SPEC-only. `/to-spec-to-done` implementation work is intentionally deferred until a later explicit implementation approval.
-- Completion of the future implementation requires one combined issue completion record, three independently reviewed module changes, contract evidence for InMemory/PostgreSQL parity, and verification that local `HEAD` equals `origin/master` after publication.
+- The implementation uses the deletion test at each step: deleting identity would recreate field comparisons across many callers; deleting lifecycle would recreate status and transition rules in Core and adapters; deleting atomic transition would force callers to manage database transaction composition.
+- ADR-002 is reinforced by the identity distinction and by keeping the Core-facing execution seam small. ADR-001 is intentionally revisited only at the inbox transaction-client seam: the current structural transaction client was a valid first slice, while this delivery hides it for the semantic transition.
+- This SPEC was initially published in a SPEC-only phase; implementation was later explicitly authorized through the Issue #19 implementation workflow.
+- Final completion still requires the combined completion comment, child and parent issue closure, merge into `master`, push, local/remote SHA equality verification, and cleanup of merged implementation worktrees and branches.
