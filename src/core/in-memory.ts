@@ -11,6 +11,8 @@ import {
   type ExecutionIdentity,
   type ExecutionLease,
   type ExecutionRecord,
+  type InboxTransitionRequest,
+  type InboxTransitionResult,
   type NfActionRuntime,
   type NfExecutionRequest,
   type NfExecutionResult,
@@ -23,6 +25,7 @@ import {
   type Receipt,
   type ReconciliationCandidate,
   type OutboxEvent,
+  DpcAdapterError,
   StaleWriteError,
 } from "./types.js";
 import {
@@ -31,6 +34,19 @@ import {
   toStableExecutionIdentity,
 } from "./identity.js";
 import { evaluateReceiptTransition } from "./lifecycle.js";
+import { InMemoryInboxStore } from "./inbox.js";
+
+interface InMemoryActionLedgerState {
+  readonly recordsByEvent: ReadonlyMap<string, ExecutionRecord>;
+  readonly recordsByAction: ReadonlyMap<string, readonly ExecutionRecord[]>;
+  readonly receiptsByEvent: ReadonlyMap<string, readonly Receipt[]>;
+  readonly outboxByDedupeKey: ReadonlyMap<string, OutboxEvent>;
+}
+
+interface InMemoryClaimAuthorityState {
+  readonly claims: ReadonlyMap<string, { readonly identity: ExecutionIdentity; readonly ownerId: string; readonly expiresAt: number }>;
+  readonly fences: ReadonlyMap<string, number>;
+}
 
 export class InMemoryPlanSource implements PlanSource {
   public readCount = 0;
@@ -184,6 +200,36 @@ export class InMemoryActionLedger implements ActionLedger {
     return [...this.outboxByDedupeKey.values()];
   }
 
+  /** Internal transaction support for InMemoryDurableStore. */
+  public captureState(): InMemoryActionLedgerState {
+    return {
+      recordsByEvent: new Map(this.recordsByEvent),
+      recordsByAction: new Map([...this.recordsByAction].map(([key, records]) => [key, [...records]])),
+      receiptsByEvent: new Map([...this.receiptsByEvent].map(([key, receipts]) => [key, [...receipts]])),
+      outboxByDedupeKey: new Map(this.outboxByDedupeKey),
+    };
+  }
+
+  /** Internal transaction support for InMemoryDurableStore. */
+  public restoreState(state: InMemoryActionLedgerState): void {
+    this.recordsByEvent.clear();
+    for (const [key, record] of state.recordsByEvent) {
+      this.recordsByEvent.set(key, record);
+    }
+    this.recordsByAction.clear();
+    for (const [key, records] of state.recordsByAction) {
+      this.recordsByAction.set(key, [...records]);
+    }
+    this.receiptsByEvent.clear();
+    for (const [key, receipts] of state.receiptsByEvent) {
+      this.receiptsByEvent.set(key, [...receipts]);
+    }
+    this.outboxByDedupeKey.clear();
+    for (const [key, event] of state.outboxByDedupeKey) {
+      this.outboxByDedupeKey.set(key, event);
+    }
+  }
+
   private recordOutbox(receipt: Receipt, eventType: string): void {
     const dedupeKey = `${eventType}:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`;
     if (!this.outboxByDedupeKey.has(dedupeKey)) {
@@ -285,6 +331,26 @@ export class InMemoryClaimAuthority implements ClaimAuthority {
     return result;
   }
 
+  /** Internal transaction support for InMemoryDurableStore. */
+  public captureState(): InMemoryClaimAuthorityState {
+    return {
+      claims: new Map(this.claims),
+      fences: new Map(this.fences),
+    };
+  }
+
+  /** Internal transaction support for InMemoryDurableStore. */
+  public restoreState(state: InMemoryClaimAuthorityState): void {
+    this.claims.clear();
+    for (const [key, claim] of state.claims) {
+      this.claims.set(key, claim);
+    }
+    this.fences.clear();
+    for (const [key, fence] of state.fences) {
+      this.fences.set(key, fence);
+    }
+  }
+
   private claimKey(identity: ExecutionIdentity): string {
     return `${identity.programId}:${identity.planId}:${identity.actionId}`;
   }
@@ -330,17 +396,27 @@ export class InMemoryNfRuntime implements NfActionRuntime {
 }
 
 /**
- * Convenience adapter that combines InMemoryActionLedger and InMemoryClaimAuthority
- * into a single DurableExecutionStore for use in tests and local development.
- * The migrate() method is a no-op because the in-memory store requires no schema setup.
+ * Convenience adapter that combines InMemoryActionLedger, InMemoryClaimAuthority
+ * and InMemoryInboxStore into a single DurableExecutionStore for use in tests
+ * and local development. The migrate() method is a no-op because the in-memory
+ * store requires no schema setup.
  */
 export class InMemoryDurableStore implements DurableExecutionStore {
   public readonly ledger: InMemoryActionLedger;
   public readonly claims: InMemoryClaimAuthority;
+  public readonly inbox: InMemoryInboxStore;
+  private readonly clock: () => number;
+  private transitionTail: Promise<void> = Promise.resolve();
 
-  public constructor(opts: { leaseDurationMs?: number; clock?: () => number } = {}) {
+  public constructor(opts: {
+    leaseDurationMs?: number;
+    clock?: () => number;
+    inbox?: InMemoryInboxStore;
+  } = {}) {
+    this.clock = opts.clock ?? (() => Date.now());
     this.ledger = new InMemoryActionLedger();
-    this.claims = new InMemoryClaimAuthority(opts.leaseDurationMs, opts.clock);
+    this.claims = new InMemoryClaimAuthority(opts.leaseDurationMs, this.clock);
+    this.inbox = opts.inbox ?? new InMemoryInboxStore();
   }
 
   public async migrate(): Promise<void> {
@@ -367,6 +443,57 @@ export class InMemoryDurableStore implements DurableExecutionStore {
 
   public withValidLease<T>(lease: ExecutionLease, operation: () => Promise<T>): Promise<T> {
     return this.claims.withValidClaim(lease.identity, operation);
+  }
+
+  /**
+   * Atomically commits the external occurrence and the execution transition.
+   * The serialized tail models the row locks used by the PostgreSQL adapter;
+   * state snapshots make failures observable as a full rollback rather than
+   * relying on the absence of a database transaction.
+   */
+  public processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
+    const operation = this.transitionTail.then(() => this.processInboxOccurrenceNow(input));
+    this.transitionTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async processInboxOccurrenceNow(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
+    const ledgerState = this.ledger.captureState();
+    const claimState = this.claims.captureState();
+    const inboxState = this.inbox.captureState();
+    try {
+      if (!sameExecutionIdentity(input.lease.identity, input.receipt.identity)) {
+        throw new StaleWriteError(`Receipt lease is stale: ${input.receipt.identity.eventKey}`);
+      }
+      const received = await this.inbox.get(input.provider, input.externalEventId);
+      if (!received || received.status !== "RECEIVED") {
+        throw new StaleWriteError(
+          `Inbox occurrence not found or already processed: ${input.provider}:${input.externalEventId}`,
+        );
+      }
+      await this.claims.assertValid(input.lease.identity, this.clock());
+      await this.ledger.appendReceiptWithClaim(input.receipt, this.claims, input.processedAt);
+      const processed = await this.inbox.markProcessed(
+        input.provider,
+        input.externalEventId,
+        input.processedAt,
+      );
+      await this.claims.release(input.receipt.identity);
+      const record = await this.ledger.findByEventKey(
+        input.receipt.identity.programId,
+        input.receipt.identity.planId,
+        input.receipt.identity.eventKey,
+      );
+      if (!record) {
+        throw new DpcAdapterError("In-memory execution disappeared after inbox transition");
+      }
+      return { occurrence: processed, record };
+    } catch (error) {
+      this.ledger.restoreState(ledgerState);
+      this.claims.restoreState(claimState);
+      this.inbox.restoreState(inboxState);
+      throw error;
+    }
   }
 
   public async appendReceipt(lease: ExecutionLease, receipt: Receipt, now: number): Promise<void> {

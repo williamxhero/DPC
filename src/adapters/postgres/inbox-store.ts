@@ -22,14 +22,10 @@ export interface PostgresInboxStoreConfig {
  * putOrIgnore uses INSERT … ON CONFLICT DO NOTHING so that concurrent
  * deliveries of the same external event ID produce exactly one row.
  *
- * markProcessed issues a single conditional UPDATE with no independent
- * transaction. This makes it composable: pass a PoolClient that is already
- * inside a transaction to include the inbox status change atomically in the
- * same execution transaction as the corresponding business receipt.
- * When no client is provided, the update runs directly on the pool (safe as a
- * single-statement CAS — no separate BEGIN/COMMIT needed).
- *
- * Throws StaleWriteError if the row is missing or already PROCESSED.
+ * `markProcessed` is retained only as a compatibility operation for legacy
+ * callers. The durable execution seam performs the same conditional update
+ * internally, in the transaction that writes the receipt and outbox event, so
+ * new callers never pass a transaction client.
  */
 export class PostgresInboxStore implements InboxStore {
   private readonly pool: Pool;
@@ -79,15 +75,12 @@ export class PostgresInboxStore implements InboxStore {
   }
 
   /**
-   * Mark the occurrence as PROCESSED using a single conditional UPDATE.
+   * Legacy compatibility operation. New callers should use
+   * PostgresExecutionStore.processInboxOccurrence(), which keeps the client
+   * and the enclosing transaction private to the execution adapter.
    *
-   * Pass a PoolClient that is already inside an open transaction to make this
-   * operation part of the same atomic write as the corresponding execution
-   * receipt. If no client is provided, the statement runs directly on the
-   * pool (a single statement is implicitly atomic — no independent BEGIN is
-   * needed or opened here).
-   *
-   * Throws StaleWriteError if no RECEIVED row exists for the given key.
+   * Pass a client only when maintaining an older caller that already owns the
+   * surrounding transaction.
    */
   public async markProcessed(
     provider: string,

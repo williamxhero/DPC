@@ -13,6 +13,8 @@ import type {
   ExecutionLease,
   ExecutionRecord,
   EventKey,
+  InboxTransitionRequest,
+  InboxTransitionResult,
   PlanId,
   ProgramId,
   Receipt,
@@ -31,6 +33,7 @@ import {
   toStableExecutionIdentity,
 } from "../../core/identity.js";
 import { evaluateReceiptTransition } from "../../core/lifecycle.js";
+import type { InboxOccurrence } from "../../core/inbox.js";
 
 export interface PostgresExecutionStoreConfig extends PoolConfig {
   readonly pool?: PgPool;
@@ -55,6 +58,16 @@ type ExecutionRow = {
   lifecycle: ExecutionRecord["lifecycle"];
   action_json: ActionDescriptor;
   receipt_json?: Receipt;
+};
+
+type InboxRow = {
+  provider: string;
+  external_event_id: string;
+  event_type: string;
+  payload_json: unknown;
+  status: InboxOccurrence["status"];
+  received_at: Date;
+  processed_at: Date | null;
 };
 
 /**
@@ -192,19 +205,52 @@ export class PostgresExecutionStore implements DurableExecutionStore {
     }
     await this.transaction(async (client) => {
       await this.lockClaim(client, receipt.identity, now);
-      const execution = await this.findExecution(client, receipt.identity.programId, receipt.identity.planId, receipt.identity.eventKey, true);
-      if (!execution) {
-        throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
-      }
-      const transition = evaluateReceiptTransition({
-        kind: "FIRST_APPEND",
-        execution,
-        receipt,
-      });
-      const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
-      await this.updateExecution(client, execution.execution_id, receipt, receiptId, transition.lifecycle);
-      await this.insertOutbox(client, `receipt:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECEIPT_RECORDED", execution.execution_id, receipt);
+      await this.appendReceiptInTransaction(client, receipt);
       await this.deleteClaim(client, receipt.identity);
+    });
+  }
+
+  private async appendReceiptInTransaction(client: Queryable, receipt: Receipt): Promise<ExecutionRecord & { readonly execution_id: string }> {
+    const execution = await this.findExecution(client, receipt.identity.programId, receipt.identity.planId, receipt.identity.eventKey, true);
+    if (!execution) {
+      throw new StaleWriteError(`Execution is not writable: ${receipt.identity.eventKey}`);
+    }
+    const transition = evaluateReceiptTransition({
+      kind: "FIRST_APPEND",
+      execution,
+      receipt,
+    });
+    const receiptId = await this.insertReceipt(client, execution.execution_id, receipt, "EXECUTION_RESULT");
+    await this.updateExecution(client, execution.execution_id, receipt, receiptId, transition.lifecycle);
+    await this.insertOutbox(client, `receipt:${receipt.identity.programId}:${receipt.identity.planId}:${receipt.identity.eventKey}:${receipt.identity.runGeneration}`, "RECEIPT_RECORDED", execution.execution_id, receipt);
+    return {
+      ...execution,
+      identity: receipt.identity,
+      lifecycle: transition.lifecycle,
+      receipt,
+    };
+  }
+
+  /**
+   * Commit an external occurrence and its execution receipt as one durable
+   * transition. The transaction client, row locks and rollback remain private
+   * to this adapter; callers provide only semantic execution data.
+   */
+  public processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult> {
+    if (!sameExecutionIdentity(input.lease.identity, input.receipt.identity)) {
+      return Promise.reject(new StaleWriteError(`Receipt lease is stale: ${input.receipt.identity.eventKey}`));
+    }
+    return this.transaction(async (client) => {
+      await this.lockClaim(client, input.lease.identity, this.clock());
+      const occurrence = await this.markInboxProcessedInTransaction(
+        client,
+        input.provider,
+        input.externalEventId,
+        input.processedAt,
+      );
+      const execution = await this.appendReceiptInTransaction(client, input.receipt);
+      await this.deleteClaim(client, input.receipt.identity);
+      return { occurrence, record: execution };
     });
   }
 
@@ -500,6 +546,34 @@ export class PostgresExecutionStore implements DurableExecutionStore {
       || row.lease_until.getTime() <= now) {
       throw new StaleWriteError(`Claim fence is stale for ${identity.actionId}`);
     }
+  }
+
+  private async markInboxProcessedInTransaction(
+    client: Queryable,
+    provider: string,
+    externalEventId: string,
+    processedAt: number,
+  ): Promise<InboxOccurrence> {
+    const result = await client.query<InboxRow>(
+      `UPDATE dpc_inbox_events
+       SET status = 'PROCESSED', processed_at = $3
+       WHERE provider = $1 AND external_event_id = $2 AND status = 'RECEIVED'
+       RETURNING provider, external_event_id, event_type, payload_json, status, received_at, processed_at`,
+      [provider, externalEventId, new Date(processedAt)],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new StaleWriteError(`Inbox occurrence not found or already processed: ${provider}:${externalEventId}`);
+    }
+    return {
+      provider: row.provider,
+      externalEventId: row.external_event_id,
+      eventType: row.event_type,
+      payload: row.payload_json,
+      status: row.status,
+      receivedAt: row.received_at.getTime(),
+      processedAt: row.processed_at ? row.processed_at.getTime() : undefined,
+    };
   }
 
   private async deleteClaim(client: Queryable, identity: ExecutionIdentity): Promise<void> {

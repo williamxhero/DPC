@@ -161,6 +161,32 @@ export interface ExecutionRecord {
   readonly receipt?: Receipt;
 }
 
+/**
+ * Semantic input for committing one received external occurrence with an
+ * execution receipt. The caller supplies an owned lease, not a transaction
+ * client; durable adapters own locking, CAS, rollback and claim release.
+ */
+export interface InboxTransitionRequest {
+  readonly provider: string;
+  readonly externalEventId: string;
+  readonly lease: ExecutionLease;
+  readonly receipt: Receipt;
+  readonly processedAt: number;
+}
+
+export interface InboxTransitionResult {
+  readonly occurrence: import("./inbox.js").InboxOccurrence;
+  readonly record: ExecutionRecord;
+}
+
+/**
+ * Durable execution capability for atomically processing an external inbox
+ * occurrence and its corresponding execution transition.
+ */
+export interface AtomicInboxTransitionStore {
+  processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
+}
+
 export interface OutboxEvent {
   readonly outboxId: string;
   readonly dedupeKey: string;
@@ -220,6 +246,12 @@ export interface ExecutionStore {
     now: number,
   ): Promise<void>;
   releaseExecution(lease: ExecutionLease): Promise<void>;
+  /**
+   * Optional capability for durable adapters. Legacy ExecutionStore
+   * implementations may omit it; DurableExecutionStore implementations expose
+   * the atomic transition without accepting a transaction client.
+   */
+  processInboxOccurrence?(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
   findByEventKey(programId: ProgramId, planId: PlanId, eventKey: EventKey): Promise<ExecutionRecord | undefined>;
   findLatestForAction(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<ExecutionRecord | undefined>;
   hasBusinessCompletion(programId: ProgramId, planId: PlanId, actionId: ActionId): Promise<boolean>;
@@ -342,8 +374,12 @@ export interface ReconciliationCandidate {
  * methods so existing adapters and tests can migrate without a flag day.
  *
  * The implementation hides action execution rows, append-only receipts, claims,
- * fences, leases, transaction boundaries, outbox insertion and reconciliation
- * queries behind one durable Adapter.
+ * fences, leases, transaction boundaries, inbox processing, outbox insertion
+ * and reconciliation queries behind one durable Adapter.
+ *
+ * `processInboxOccurrence` atomically changes an existing RECEIVED occurrence
+ * to PROCESSED together with its receipt, lifecycle/current pointer, outbox
+ * event and owned claim release. Its transaction mechanics are adapter-owned.
  *
  * ## Transaction semantics
  * `startExecution` is idempotent for the scoped execution identity. The
@@ -381,6 +417,11 @@ export interface ReconciliationCandidate {
  * already-migrated schema MUST succeed without modifying existing data.
  */
 export interface DurableExecutionStore extends ActionLedger, ClaimAuthority, ExecutionStore, ReceiptHistoryReader, OutboxReader, ReconciliationReader {
+  /**
+   * Atomically process one existing RECEIVED inbox occurrence with its
+   * execution receipt and coordination side effects.
+   */
+  processInboxOccurrence(input: InboxTransitionRequest): Promise<InboxTransitionResult>;
   /**
    * Apply (or verify) the versioned schema migration.
    * Safe to call on every startup — idempotent, never destructive.

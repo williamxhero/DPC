@@ -26,10 +26,10 @@ export interface InboxOccurrence {
  * Durable external occurrence-ID inbox.
  *
  * An inbox row records that an external system delivered an event identified by
- * (provider, externalEventId). The row is NOT a business fact until
- * markProcessed() is called inside the same execution transaction that creates
- * the business receipt. Callers must coordinate this atomicity; the store
- * interface does not enforce it on its own.
+ * (provider, externalEventId). The row is NOT a business fact until the
+ * execution seam's semantic inbox transition commits the corresponding receipt.
+ * The legacy markProcessed operation remains only for compatibility with older
+ * callers and does not compose a receipt transaction by itself.
  *
  * ## Idempotency
  * putOrIgnore is idempotent: a repeated call for the same (provider,
@@ -59,9 +59,9 @@ export interface InboxStore {
   get(provider: string, externalEventId: string): Promise<InboxOccurrence | undefined>;
 
   /**
-   * Mark the occurrence as PROCESSED. Must be called inside the same
-   * execution transaction that records the corresponding business receipt so
-   * that receipt and inbox-status update atomically.
+   * Legacy compatibility operation for callers that still coordinate their
+   * own receipt transaction. New durable callers must use the execution seam's
+   * semantic inbox transition instead of passing a transaction client here.
    *
    * Throws StaleWriteError if no occurrence exists or if already PROCESSED.
    */
@@ -124,5 +124,18 @@ export class InMemoryInboxStore implements InboxStore {
     const updated: InboxOccurrence = { ...existing, status: "PROCESSED", processedAt };
     this.occurrences.set(k, updated);
     return updated;
+  }
+
+  /** Internal transaction support for InMemoryDurableStore. */
+  public captureState(): ReadonlyMap<string, InboxOccurrence> {
+    return new Map(this.occurrences);
+  }
+
+  /** Internal transaction support for InMemoryDurableStore. */
+  public restoreState(state: ReadonlyMap<string, InboxOccurrence>): void {
+    this.occurrences.clear();
+    for (const [key, occurrence] of state) {
+      this.occurrences.set(key, occurrence);
+    }
   }
 }
